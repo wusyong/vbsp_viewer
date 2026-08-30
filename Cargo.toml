@@ -1,0 +1,16 @@
+[package]
+name = "tf2-bevy-viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19.1", features = ["dynamic_linking"] }
+# Parses the BSP itself. Note it does not expose the lighting lump, so
+# milestone 1.4 will need a side-parser for lump 8.
+vbsp = "0.9"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

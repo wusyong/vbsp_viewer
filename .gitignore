@@ -1,0 +1,5 @@
+/target
+# Valve's map data cannot be redistributed -- regenerate it from your own TF2
+# install (see README.md). The glb is ~170 MB anyway.
+/assets/maps/
+shot.png
