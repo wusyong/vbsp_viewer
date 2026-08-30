@@ -21,11 +21,6 @@ use vbsp::{Bsp, Face, Handle, TextureInfo};
 
 use super::lightmap::Lightmaps;
 
-/// vbsp's glam, which is 0.30 against bevy's 0.32 — a different crate version,
-/// so a different `Vec3`. Aliased so the conversion boundary is visible rather
-/// than a confusing "expected Vec3, found Vec3".
-use glam::Vec3 as SourceVec3;
-
 /// 1 Hammer unit = 1 inch. This puts 2fort at ~120 m end to end and a doorway at
 /// human height, which is the check that matters. Both of icewind's tools use
 /// 1.905 cm instead; that number makes the player 1.37 m tall.
@@ -39,14 +34,19 @@ pub const REFERENCE_YAW: f32 = std::f32::consts::FRAC_PI_2;
 /// is a cyclic permutation, so it preserves handedness and leaves triangle
 /// winding alone. The roadmap's `(x, z, -y)` mirrors instead, which is why that
 /// route then needs every index list reversed to compensate.
+///
+/// Since vbsp was vendored onto glam 0.32 both sides of this are the same
+/// `Vec3`, so nothing but the argument name says which space a vector is in.
+/// The rule: anything straight out of vbsp is Z-up in Hammer units and has to
+/// come through here exactly once.
 #[inline]
-pub fn to_bevy(v: SourceVec3) -> Vec3 {
+pub fn to_bevy(v: Vec3) -> Vec3 {
     Vec3::new(v.y, v.z, v.x) * HAMMER_UNIT
 }
 
 /// Same permutation without the unit scale, for directions.
 #[inline]
-fn dir_to_bevy(v: SourceVec3) -> Vec3 {
+fn dir_to_bevy(v: Vec3) -> Vec3 {
     Vec3::new(v.y, v.z, v.x)
 }
 
@@ -54,7 +54,7 @@ fn dir_to_bevy(v: SourceVec3) -> Vec3 {
 /// brush entities.
 pub struct BrushModel {
     pub index: usize,
-    pub origin: SourceVec3,
+    pub origin: Vec3,
     pub classname: String,
 }
 
@@ -69,7 +69,7 @@ pub struct BrushModel {
 pub fn brush_models(bsp: &Bsp) -> Vec<BrushModel> {
     let mut models = vec![BrushModel {
         index: 0,
-        origin: SourceVec3::ZERO,
+        origin: Vec3::ZERO,
         classname: "worldspawn".into(),
     }];
 
@@ -92,7 +92,7 @@ pub fn brush_models(bsp: &Bsp) -> Vec<BrushModel> {
             origin: entity
                 .prop_parse::<[f32; 3]>("origin")
                 .and_then(Result::ok)
-                .map_or(SourceVec3::ZERO, SourceVec3::from_array),
+                .map_or(Vec3::ZERO, Vec3::from_array),
             classname: entity.prop("classname").unwrap_or("?").to_string(),
         });
     }
@@ -233,7 +233,7 @@ fn push_face(
     accum: &mut Accum,
     face: &Handle<Face>,
     texture: &Handle<TextureInfo>,
-    origin: SourceVec3,
+    origin: Vec3,
     patch: Option<(Vec2, Vec2)>,
     stats: &mut Stats,
 ) {
@@ -257,7 +257,7 @@ fn push_face(
     match patch {
         Some((min, size)) => accum.lightmap_uvs.extend(
             face.lightmap_uvs()
-                .map(|uv| (min + size * Vec2::new(uv.x, uv.y)).to_array()),
+                .map(|uv| (min + size * uv).to_array()),
         ),
         None => accum
             .lightmap_uvs

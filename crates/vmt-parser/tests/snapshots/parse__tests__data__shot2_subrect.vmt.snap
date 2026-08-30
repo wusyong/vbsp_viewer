@@ -1,0 +1,17 @@
+---
+source: tests/parse.rs
+expression: result
+---
+{
+  "subrect": {
+    "$material": "decals/decals_mod2x",
+    "$pos": [
+      64.0,
+      0.0
+    ],
+    "$size": [
+      64.0,
+      64.0
+    ]
+  }
+}

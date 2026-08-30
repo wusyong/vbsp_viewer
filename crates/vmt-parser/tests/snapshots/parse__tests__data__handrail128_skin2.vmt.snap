@@ -1,0 +1,45 @@
+---
+source: tests/parse.rs
+expression: result
+---
+{
+  "vertexlitgeneric": {
+    "$basetexture": "models/props_trainyard/handrail128_skin2",
+    "$detail": null,
+    "$decaltexture": null,
+    "$color2": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "$basetexturetransform": "center 0.5 0.5 scale 1 1 rotate 0 translate 0 0",
+    "$color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "$decalscale": [
+      4.0,
+      4.0
+    ],
+    "$detailblendfactor": 1.0,
+    "$detailblendmode": 1,
+    "$modelmaterial": null,
+    "$pointsamplemagfilter": false,
+    "$seamless_scale": 1.0,
+    "$alpha": 1.0,
+    "$alphatest": false,
+    "$alphatestreference": 1.0,
+    "$distancealpha": false,
+    "$nocull": false,
+    "$translucent": false,
+    "$bumpmap": null,
+    "$lightwarptexture": null,
+    "$selfillum": false,
+    "$ssbump": false,
+    "$envmap": null,
+    "$phong": 0.0,
+    "$nofog": false,
+    "$ignorez": false
+  }
+}

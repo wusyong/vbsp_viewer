@@ -1,0 +1,52 @@
+# VENDORED from https://github.com/eira-fransham/qbsp @ ca4e05b4ece63cba883615144e31286c01222672
+#
+# Upstream is its own workspace root. Its [workspace] and [workspace.package]
+# tables were removed so this can be a member of the fps workspace instead, and
+# the six fields they supplied are inlined below (here and in qbsp_macros/ and
+# tools/write-lightmaps/). Nothing else in the crate has been changed.
+
+[package]
+name = "qbsp"
+readme = "readme.md"
+categories = ["game-development"]
+exclude = ["assets"]
+
+description = "Rust crate for parsing and operating with Quake 1, 2, and GoldSrc BSP files"
+version = "0.14.1"
+edition = "2024"
+authors = ["Noxmore"]
+repository = "https://github.com/Noxmore/qbsp"
+license = "MIT OR Apache-2.0"
+
+
+[dependencies]
+qbsp_macros = { version = "0.14.1", path = "qbsp_macros" }
+
+bitflags = "2"
+glam = "0.32" # See paragraph below.
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+texture_packer = { version = "0.30", optional = true }
+thiserror = "2"
+derive_more = { version = "2", features = [
+	"deref",
+	"deref_mut",
+	"into_iterator",
+] }
+# The API is pretty stable, and I'd rather not get tied to Bevy's release cycle.
+# Unfortunately, Cargo doesn't seem to know how to resolve a wildcard to anything other than
+# the latest version in this situation, so the version has to be more precise than 0.*.
+bevy_reflect = { version = "0.19", package = "bevy_reflect", features = [
+	"glam",
+], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde-big-array = { version = "0.5", optional = true }
+
+[dev-dependencies]
+quake-util = { version = "0.4", features = ["std"] }
+
+[features]
+default = ["meshing"]
+meshing = ["dep:texture_packer"]
+"bevy_reflect" = ["dep:bevy_reflect"]
+serde = ["dep:serde", "dep:serde-big-array", "smallvec/serde", "bitflags/serde"]

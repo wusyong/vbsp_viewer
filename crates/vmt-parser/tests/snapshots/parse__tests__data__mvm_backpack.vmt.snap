@@ -1,0 +1,27 @@
+---
+source: tests/parse.rs
+expression: result
+---
+{
+  "unlitgeneric": {
+    "$basetexture": "vgui/pve/mvm_backpack",
+    "$surfaceprop": null,
+    "$model": false,
+    "$color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "$alpha": 1.0,
+    "$alphatest": false,
+    "$alphatestreference": 1.0,
+    "$nocull": false,
+    "$translucent": true,
+    "$bumpmap": null,
+    "$ignorez": true,
+    "$nofog": false,
+    "$receiveflashlight": false,
+    "singlepassflashlight": false,
+    "$no_fullbright": true
+  }
+}

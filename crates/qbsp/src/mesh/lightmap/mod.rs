@@ -1,0 +1,323 @@
+//! Module for computing lightmap atlases with various techniques for GPU rendering.
+
+use std::collections::HashMap;
+
+use glam::{UVec2, Vec2, uvec2};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Pixel, Rgb};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use smallvec::{SmallVec, smallvec};
+use thiserror::Error;
+
+mod packer;
+
+pub use packer::{DefaultLightmapPacker, LightmapPacker, LightmapPackerFaceView, PerSlotLightmapPackerRgb, PerStyleLightmapPackerRgb};
+
+use crate::{
+	BspData,
+	data::{BspLighting, lighting::LightmapStyle, texture::BspTexFlags},
+	mesh::FaceExtents,
+};
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ComputeLightmapSettings {
+	/// The of a pixel is no lightmaps are stored there.
+	pub default_color: [u8; 3],
+	/// A single pixel of a lightmap atlas is reserved for faces which don't have a lightmap or `special` flag, this is the color of that pixel.
+	pub no_lighting_color: [u8; 3],
+	/// A single pixel of a lightmap atlas is reserved for faces which don't have a lightmap, but do have the `special` flag, this is the color of that pixel.
+	pub special_lighting_color: [u8; 3],
+	pub max_width: u32,
+	pub max_height: u32,
+	/// Number of pixels to pad around each island, stretches the sides of textures.
+	pub extrusion: u32,
+}
+impl Default for ComputeLightmapSettings {
+	fn default() -> Self {
+		Self {
+			default_color: [0; 3],
+			no_lighting_color: [0; 3],
+			special_lighting_color: [255; 3],
+			max_width: 2048,
+			max_height: u32::MAX,
+			extrusion: 0,
+		}
+	}
+}
+
+#[derive(Error, Debug, Clone)]
+pub enum ComputeLightmapAtlasError {
+	#[error(
+		"Failed to pack lightmap of size {lightmap_size}, {images_packed} lightmaps have already been packed. Max atlas size: {max_lightmap_size}"
+	)]
+	PackFailure {
+		lightmap_size: UVec2,
+		images_packed: usize,
+		max_lightmap_size: UVec2,
+	},
+	#[error("No lightmaps")]
+	NoLightmaps,
+}
+
+pub struct ReservedLightmapPixel {
+	pub position: Option<UVec2>,
+	pub color: [u8; 3],
+}
+
+impl ReservedLightmapPixel {
+	pub fn new(color: [u8; 3]) -> Self {
+		Self { position: None, color }
+	}
+
+	pub fn get_uvs<P, Px>(
+		&mut self,
+		lightmap_packer: &mut P,
+		num_edges: usize,
+		view: LightmapPackerFaceView<Px::Subpixel>,
+	) -> Result<FaceUvs, ComputeLightmapAtlasError>
+	where
+		P: LightmapPacker,
+		Px: Pixel,
+		DynamicImage: From<ImageBuffer<Px, Vec<Px::Subpixel>>>,
+	{
+		let position = match self.position {
+			Some(v) => v,
+			None => {
+				// TODO: Is this handled by `texture_packer`?
+				let rect = lightmap_packer.pack::<Px>(
+					view,
+					P::create_single_color_input(UVec2::ONE + lightmap_packer.settings().extrusion * 2, self.color),
+				)?;
+				self.position = Some(rect.min);
+				rect.min
+			}
+		};
+
+		Ok(smallvec![position.as_vec2() + Vec2::splat(0.5); num_edges])
+	}
+}
+
+impl BspData {
+	fn compute_lightmap_atlas_with_pixel<P, Px>(
+		&self,
+		mut packer: P,
+		lighting_buffer: &[Px::Subpixel],
+	) -> Result<LightmapAtlasOutput<P>, ComputeLightmapAtlasError>
+	where
+		P: LightmapPacker,
+		Px: Pixel,
+		DynamicImage: From<ImageBuffer<Px, Vec<Px::Subpixel>>>,
+	{
+		let settings = packer.settings();
+
+		let mut lightmap_uvs: HashMap<u32, FaceUvs> = HashMap::new();
+
+		let mut empty_reserved_pixel = ReservedLightmapPixel::new(settings.no_lighting_color);
+		let mut special_reserved_pixel = ReservedLightmapPixel::new(settings.special_lighting_color);
+
+		for (face_idx, face) in self.faces.iter().enumerate() {
+			let tex_info = &self.tex_info[face.texture_info_idx.0 as usize];
+
+			let decoupled_lightmap = self.bspx.decoupled_lm.as_ref().map(|lm_infos| lm_infos[face_idx]);
+
+			let lm_extents;
+			let lm_uvs: FaceUvs;
+			let lm_info = match &decoupled_lightmap {
+				Some(lm_info) => {
+					lm_uvs = face.vertices(self).map(|pos| lm_info.projection.project(pos)).collect();
+					lm_extents = FaceExtents::new_decoupled(lm_uvs.iter().copied(), lm_info);
+
+					LightmapInfo {
+						lightmap_size: lm_extents.lightmap_size(),
+						lightmap_offset: lm_info.offset.pixels,
+					}
+				}
+				None => {
+					lm_uvs = face.vertices(self).map(|pos| tex_info.projection.project(pos)).collect();
+					lm_extents = FaceExtents::new(lm_uvs.iter().copied());
+
+					LightmapInfo {
+						lightmap_size: lm_extents.lightmap_size(),
+						lightmap_offset: face.lightmap_offset.pixels,
+					}
+				}
+			};
+
+			let view = LightmapPackerFaceView {
+				lm_info: &lm_info,
+
+				face_idx,
+				lightmap_styles: face.lightmap_styles,
+				lighting_buffer,
+			};
+
+			if lm_info.lightmap_offset.is_negative() || lm_info.lightmap_size == UVec2::ZERO {
+				lightmap_uvs.insert(
+					face_idx as u32,
+					if tex_info.flags.texture_flags.unwrap_or_default() == BspTexFlags::Normal {
+						empty_reserved_pixel.get_uvs::<P, Px>(&mut packer, face.num_edges.0 as usize, view)?
+					} else {
+						special_reserved_pixel.get_uvs::<P, Px>(&mut packer, face.num_edges.0 as usize, view)?
+					},
+				);
+				continue;
+			}
+
+			let input = packer.read_from_face::<Px>(view);
+
+			let frame = packer.pack::<Px>(view, input)?;
+
+			lightmap_uvs.insert(
+				face_idx as u32,
+				lm_extents
+					.compute_lightmap_uvs(lm_uvs, (frame.min + settings.extrusion).as_vec2())
+					.collect(),
+			);
+		}
+
+		let atlas = packer.export();
+
+		// Normalize lightmap UVs from texture space
+		for uvs in lightmap_uvs.values_mut() {
+			for uv in uvs {
+				*uv /= atlas.size().as_vec2();
+			}
+		}
+
+		Ok(LightmapAtlasOutput {
+			uvs: lightmap_uvs,
+			data: atlas,
+		})
+	}
+
+	/// Packs every face's lightmap together onto a single atlas for GPU rendering.
+	pub fn compute_lightmap_atlas<P: LightmapPacker>(&self, packer: P) -> Result<LightmapAtlasOutput<P>, ComputeLightmapAtlasError> {
+		match &self.lighting {
+			Some(BspLighting::Grayscale(data)) => self.compute_lightmap_atlas_with_pixel::<P, Luma<u8>>(packer, data),
+			Some(BspLighting::Colored(data)) => self.compute_lightmap_atlas_with_pixel::<P, Rgb<u8>>(packer, data.as_flattened()),
+			None => todo!(),
+		}
+	}
+}
+
+/// Computed information about the specifics of how a lightmap applies to a face.
+#[derive(Debug, Clone)]
+pub struct LightmapInfo {
+	pub lightmap_size: UVec2,
+	/// The offset into the lightmap lump in bytes to read the lightmap data or -1. Will need to be multiplied by 3 for colored lighting.
+	pub lightmap_offset: i32,
+}
+impl LightmapInfo {
+	/// Computes the index into [`BspLighting`](crate::data::lighting::BspLighting) for the specific face specified. Assumes [`lightmap_offset`](Self::lightmap_offset) is positive.
+	#[inline]
+	pub fn compute_lighting_index(&self, light_style_idx: usize, x: u32, y: u32) -> usize {
+		self.lightmap_offset as usize + (self.lightmap_size.element_product() as usize * light_style_idx) + (y * self.lightmap_size.x + x) as usize
+	}
+}
+
+/// Trait for a resulting lightmap atlas from a [`LightmapPacker`].
+pub trait LightmapAtlas {
+	fn size(&self) -> UVec2;
+}
+
+pub struct PerSlotLightmapData<Opaque = image::RgbImage, Translucent = image::RgbaImage> {
+	pub slots: [Opaque; 4],
+	pub styles: Translucent,
+}
+impl LightmapAtlas for PerSlotLightmapData {
+	fn size(&self) -> UVec2 {
+		self.styles.dimensions().into()
+	}
+}
+
+/// Container for mapping lightmap styles to lightmap images (either atlas' or standalone) to later composite together to achieve animated lightmaps.
+///
+/// This is just a wrapper for a HashMap that ensures that all containing images are the same size.
+#[derive(Debug, Clone)]
+pub struct PerStyleLightmapData<Image = image::RgbImage> {
+	size: UVec2,
+	inner: HashMap<LightmapStyle, Image>,
+}
+
+impl<Image> PerStyleLightmapData<Image>
+where
+	Image: GenericImageView,
+{
+	#[inline]
+	pub fn new(size: impl Into<UVec2>) -> Self {
+		Self {
+			size: size.into(),
+			inner: HashMap::new(),
+		}
+	}
+
+	#[inline]
+	pub fn inner(&self) -> &HashMap<LightmapStyle, Image> {
+		&self.inner
+	}
+
+	#[inline]
+	pub fn into_inner(self) -> HashMap<LightmapStyle, Image> {
+		self.inner
+	}
+
+	/// Modifies the internal map, checking to ensure all images are the same size after.
+	pub fn modify_inner<O, F: FnOnce(&mut HashMap<LightmapStyle, Image>) -> O>(&mut self, modifier: F) -> Result<O, LightmapsInvalidSizeError> {
+		let out = modifier(&mut self.inner);
+
+		for (style, image) in &self.inner {
+			let image_size = uvec2(image.width(), image.height());
+			if self.size != image_size {
+				return Err(LightmapsInvalidSizeError {
+					style: *style,
+					image_size,
+					expected_size: self.size,
+				});
+			}
+		}
+
+		Ok(out)
+	}
+
+	/// Inserts a new image into the collection. Returns `Err` if the atlas' size doesn't match the collection's expected size.
+	pub fn insert(&mut self, style: LightmapStyle, image: Image) -> Result<Option<Image>, LightmapsInvalidSizeError> {
+		let image_size = uvec2(image.width(), image.height());
+		if self.size != image_size {
+			return Err(LightmapsInvalidSizeError {
+				style,
+				image_size,
+				expected_size: self.size,
+			});
+		}
+
+		Ok(self.inner.insert(style, image))
+	}
+}
+
+impl<Image> LightmapAtlas for PerStyleLightmapData<Image> {
+	fn size(&self) -> UVec2 {
+		self.size
+	}
+}
+
+#[derive(Debug, Error)]
+#[error("Lightmap image of style {style} is size {image_size}, when the lightmap collection's expected size is {expected_size}")]
+pub struct LightmapsInvalidSizeError {
+	pub style: LightmapStyle,
+	pub image_size: UVec2,
+	pub expected_size: UVec2,
+}
+
+/// Contains a lightmap packers' output, and the UVs into said atlas' for each face.
+pub struct LightmapAtlasOutput<P: LightmapPacker> {
+	/// Map of face indexes to normalized UV coordinates into the atlas.
+	pub uvs: LightmapUvMap,
+	pub data: P::Output,
+}
+
+/// Maps face indexes to normalized UV coordinates into a lightmap atlas.
+pub type LightmapUvMap = HashMap<u32, FaceUvs>;
+
+/// The vast majority of faces have 5 or less vertices, so this is a pretty easy optimization.
+pub type FaceUvs = SmallVec<[Vec2; 5]>;

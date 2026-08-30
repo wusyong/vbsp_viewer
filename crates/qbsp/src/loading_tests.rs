@@ -1,0 +1,284 @@
+//! Tests loading and checking the validity of BSP files.
+
+use crate::{
+	data::{lighting::BspLighting, nodes::BspNodeRef},
+	prelude::*,
+	util::{quake_string_to_utf8, quake_string_to_utf8_lossy},
+};
+
+fn default<T: Default>() -> T {
+	T::default()
+}
+
+#[derive(Clone, Copy)]
+pub struct TestingBsp {
+	pub name: &'static str,
+	pub bsp: &'static [u8],
+	pub lit: Option<&'static [u8]>,
+}
+
+macro_rules! testing_bsp {
+	($name:literal) => {
+		TestingBsp {
+			name: $name,
+			bsp: include_bytes!(concat!("../assets/", $name)),
+			lit: None,
+		}
+	};
+	($name:literal, $lit:literal) => {
+		TestingBsp {
+			name: $name,
+			bsp: include_bytes!(concat!("../assets/", $name)),
+			lit: Some(include_bytes!(concat!("../assets/", $lit))),
+		}
+	};
+}
+
+/// `bevy_trenchbroom`'s `example.bsp` in different formats.
+static EXAMPLE_BSPS: &[TestingBsp] = &[
+	testing_bsp!("example-halflife.bsp"),
+	testing_bsp!("example-quake2.bsp"),
+	testing_bsp!("example-bsp29.bsp"),
+	testing_bsp!("example-bsp2.bsp"),
+];
+
+static TESTING_BSPS: &[TestingBsp] = &[
+	testing_bsp!("ad_crucial.bsp", "ad_crucial.lit"),
+	testing_bsp!("ad_end.bsp", "ad_end.lit"),
+	testing_bsp!("ad_tears.bsp", "ad_tears.lit"),
+	testing_bsp!("librequake/lq_e0m1.bsp"),
+	testing_bsp!("librequake/lq_e0m2.bsp"),
+	testing_bsp!("librequake/lq_e0m3.bsp"),
+	testing_bsp!("librequake/lq_e0m4.bsp"),
+	testing_bsp!("librequake/lq_e0m1-quake2.bsp"),
+	testing_bsp!("librequake/lq_e0m2-quake2.bsp"),
+	testing_bsp!("librequake/lq_e0m3-quake2.bsp"),
+	testing_bsp!("librequake/lq_e0m4-quake2.bsp"),
+];
+
+fn all_bsps() -> impl Iterator<Item = TestingBsp> {
+	TESTING_BSPS.iter().chain(EXAMPLE_BSPS.iter()).copied()
+}
+
+#[test]
+fn use_bspx_rgb_lighting() {
+	for TestingBsp { name, bsp, lit: _ } in EXAMPLE_BSPS.iter().copied() {
+		println!("{name}");
+
+		let with_usage = BspData::parse(BspParseInput {
+			bsp,
+			lit: None,
+			settings: BspParseSettings {
+				use_bspx_rgb_lighting: true,
+				..default()
+			},
+		})
+		.unwrap();
+
+		let without_usage = BspData::parse(BspParseInput {
+			bsp,
+			lit: None,
+			settings: BspParseSettings {
+				use_bspx_rgb_lighting: false,
+				..default()
+			},
+		})
+		.unwrap();
+
+		assert!(matches!(with_usage.lighting, Some(BspLighting::Colored(_))));
+		// The Half-Life and Quake 2 BSPs always contain basic lighting, even if specified not to.
+		if name == "example.bsp" {
+			assert!(without_usage.lighting.is_none());
+		}
+	}
+}
+
+#[test]
+fn lit_loading() {
+	for TestingBsp { name, bsp, lit } in all_bsps() {
+		println!("{name}");
+		if lit.is_none() {
+			continue;
+		};
+
+		let data = match BspData::parse(BspParseInput {
+			bsp,
+			lit,
+			settings: BspParseSettings::default(),
+		}) {
+			Ok(data) => data,
+			Err(err) => panic!("Error loading {name}: {err}"),
+		};
+
+		assert!(matches!(data.lighting, Some(BspLighting::Colored(_))));
+	}
+}
+
+#[test]
+fn validate_bounds() {
+	#[track_caller]
+	fn validate_node_ref(node_ref: &BspNodeRef, data: &BspData) {
+		match node_ref {
+			BspNodeRef::Node(node_idx) => assert!(*node_idx < data.nodes.len().max(1) as u32),
+			BspNodeRef::Leaf(leaf_idx) => assert!(*leaf_idx < data.leaves.len().max(1) as u32),
+		}
+	}
+
+	#[track_caller]
+	fn validate_range(start: u32, num: u32, len: usize) {
+		if num == 0 {
+			return;
+		}
+		assert!((start as usize + num.saturating_sub(1) as usize) < len)
+	}
+
+	for TestingBsp { name, bsp, lit } in all_bsps() {
+		println!("{name}");
+		let data = match BspData::parse(BspParseInput {
+			bsp,
+			lit,
+			settings: BspParseSettings::default(),
+		}) {
+			Ok(data) => data,
+			Err(err) => panic!("Error loading {name}: {err}"),
+		};
+
+		// We max(1) the lengths here to make index 0 a valid index for a length of 0
+
+		for node in &data.nodes {
+			assert!(node.plane_idx < data.planes.len().max(1) as u32);
+			validate_range(node.face_idx.0, node.face_num.0, data.faces.len());
+			validate_node_ref(&node.front, &data);
+			validate_node_ref(&node.back, &data);
+		}
+
+		for tex_info in &data.tex_info {
+			if let Some(texture_idx) = *tex_info.texture_idx {
+				assert!(texture_idx < data.textures.len().max(1) as u32);
+			} else {
+				assert!(tex_info.extra_info.is_some());
+			}
+		}
+
+		for face in &data.faces {
+			validate_range(face.first_edge, face.num_edges.0, data.surface_edges.len());
+			assert!(face.texture_info_idx.0 < data.tex_info.len().max(1) as u32);
+			if let Some(lighting) = &data.lighting {
+				assert!((face.lightmap_offset.pixels as i64) < lighting.len().max(1) as i64);
+			}
+		}
+
+		for clip_node in &data.clip_nodes {
+			assert!(clip_node.plane_idx < data.planes.len().max(1) as u32);
+			assert!(clip_node.front.leaf().is_some() || (clip_node.front.node().unwrap() as usize) < data.clip_nodes.len().max(1));
+			assert!(clip_node.back.leaf().is_some() || (clip_node.back.node().unwrap() as usize) < data.clip_nodes.len().max(1));
+		}
+
+		for leaf in &data.leaves {
+			// TODO: Check `area` when implemented
+
+			validate_range(leaf.face_idx.0, leaf.face_num.0, data.mark_surfaces.len());
+
+			if let Some(leaf_brushes) = &leaf.leaf_brushes {
+				validate_range(leaf_brushes.idx.0, leaf_brushes.num.0, data.leaf_brushes.len());
+			}
+		}
+
+		if !data.visibility.visdata.is_empty() {
+			for leaf in &data.leaves {
+				if leaf.visdata.is_empty() {
+					continue;
+				}
+
+				assert!(data.visibility.pvs(leaf.visdata).is_some());
+			}
+		}
+
+		for surface_idx in &data.mark_surfaces {
+			assert!(surface_idx.0 < data.faces.len().max(1) as u32, "Failed for {name}");
+		}
+
+		for edge in &data.edges {
+			assert!(edge.a.0 < data.vertices.len().max(1) as u32);
+			assert!(edge.b.0 < data.vertices.len().max(1) as u32);
+		}
+
+		for surface_edge in &data.surface_edges {
+			assert!((surface_edge.unsigned_abs()) < data.edges.len().max(1) as u32);
+		}
+
+		for model in &data.models {
+			validate_node_ref(&model.hulls.root, &data);
+			if let Some(clip_nodes) = model.hulls.for_size {
+				assert!((clip_nodes.small.node().unwrap() as usize) < data.clip_nodes.len().max(1));
+				assert!((clip_nodes.large.node().unwrap() as usize) < data.clip_nodes.len().max(1));
+			}
+
+			validate_range(model.first_face, model.num_faces, data.faces.len());
+		}
+
+		for brush in &data.brushes {
+			validate_range(brush.first_side, brush.num_sides, data.brush_sides.len());
+		}
+
+		for brush_side in &data.brush_sides {
+			assert!(brush_side.plane_idx.0 < data.planes.len().max(1) as u32);
+			assert!(brush_side.tex_info_idx.0 < data.tex_info.len().max(1) as u32);
+		}
+
+		assert_eq!(!data.leaf_brushes.is_empty(), data.parse_ctx.format.is_quake2());
+		for leaf_brush in data.leaf_brushes.iter().copied() {
+			assert!(leaf_brush.0 < data.brushes.len().max(1) as u32);
+		}
+
+		if let Some(light_grid) = &data.bspx.light_grid_octree {
+			assert!(light_grid.root_idx < light_grid.nodes.len().max(1) as u32);
+		}
+
+		if let Some(brush_list) = &data.bspx.brush_list {
+			for model_brushes in brush_list {
+				assert!(model_brushes.model_idx < data.models.len().max(1) as u32);
+			}
+		}
+
+		if let Some(decoupled_lm) = &data.bspx.decoupled_lm {
+			assert_eq!(decoupled_lm.len(), data.faces.len());
+
+			if let Some(lighting) = &data.lighting {
+				for lm_info in decoupled_lm {
+					assert!(lm_info.offset.pixels < lighting.len() as i32);
+				}
+			}
+		}
+
+		if let Some(face_normals) = &data.bspx.face_normals {
+			assert_eq!(face_normals.faces.len(), data.faces.len());
+			for face in &face_normals.faces {
+				validate_range(face.vertex_start, face.vertex_count, face_normals.face_vertices.len());
+			}
+			for vertex in &face_normals.face_vertices {
+				assert!(vertex.normal_idx < face_normals.unique_vecs.len().max(1) as u32);
+				assert!(vertex.tangent_idx < face_normals.unique_vecs.len().max(1) as u32);
+				assert!(vertex.bi_tangent_idx < face_normals.unique_vecs.len().max(1) as u32);
+			}
+		}
+	}
+}
+
+#[test]
+fn entity_lump_loading() {
+	for TestingBsp { name, bsp, lit: _ } in all_bsps() {
+		println!("{name}");
+		let mut data = match BspData::parse(BspParseInput {
+			bsp,
+			lit: None,
+			settings: BspParseSettings::default(),
+		}) {
+			Ok(data) => data,
+			Err(err) => panic!("Error loading {name}: {err}"),
+		};
+
+		quake_util::qmap::parse(&mut std::io::Cursor::new(quake_string_to_utf8(&data.entities, "\\b", "\\b"))).unwrap();
+		quake_util::qmap::parse(&mut std::io::Cursor::new(quake_string_to_utf8_lossy(&mut data.entities))).unwrap();
+	}
+}

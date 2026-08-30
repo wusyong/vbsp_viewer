@@ -1,0 +1,28 @@
+name: "CI"
+on:
+  pull_request:
+  push:
+
+jobs:
+  checks:
+    runs-on: nix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://codeberg.org/icewind/attic-action@v1
+        with:
+          name: ci
+          instance: https://cache.icewind.me
+          authToken: "${{ secrets.ATTIC_TOKEN }}"
+      - run: nix flake check --keep-going
+
+  semver:
+    runs-on: nix
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://codeberg.org/icewind/attic-action@v1
+        with:
+          name: ci
+          instance: https://cache.icewind.me
+          authToken: "${{ secrets.ATTIC_TOKEN }}"
+      - run: nix run .#semver-checks

@@ -1,0 +1,6 @@
+target
+*.bench
+*.obj
+result
+.direnv
+*.snap.new

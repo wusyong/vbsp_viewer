@@ -1,0 +1,53 @@
+# VENDORED from https://github.com/eira-fransham/vbsp @ cd1711720be854654be7708fec44b2b11fc08424
+# (a fork of icewind's vbsp 0.9.1 that exposes the lighting lump).
+#
+# Three changes from upstream, all in this file:
+#   * [workspace] members = ["common"] removed -- common/ is a member of the fps
+#     workspace now instead.
+#   * [profile.dev] removed -- profiles are only honoured in a workspace root,
+#     so leaving it here would just warn. The root sets opt-level for us.
+#   * the qbsp dependency points at ../qbsp rather than its git URL.
+# The source tree itself is untouched.
+
+[package]
+name = "vbsp"
+version = "0.9.1"
+authors = ["Robin Appelman <robin@icewind.nl>"]
+homepage = "https://codeberg.org/icewind/vbsp"
+repository = "https://codeberg.org/icewind/vbsp"
+description = "Rust parser for valve bsp files."
+license = "MIT"
+edition = "2024"
+readme = "README.md"
+exclude = ["*.bsp"]
+rust-version = "1.85.0"
+
+[dependencies]
+qbsp = { path = "../qbsp" }
+vbsp-common = { version = "0.1.0", path = "common" }
+arrayvec = "0.7.6"
+bitflags = "2.8.0"
+bit-vec = "0.9"
+glam = "0.32"
+thiserror = "2.0.11"
+lzma-rs = "0.3.0"
+binrw = "0.14.1"
+static_assertions = "1.1.0"
+num_enum = "0.7.3"
+tracing = "0.1"
+zip = "8.2"
+itertools = "0.14.0"
+image = "0.25"
+ahash = "0.8.11"
+serde = "1.0.218"
+vdf-reader = "0.3.0"
+
+[dev-dependencies]
+obj = "0.10"
+main_error = "0.1.2"
+criterion = "0.5.1"
+vbsp-entities-tf2 = { version = "0.1.0-egg" }
+
+[[bench]]
+name = "bench"
+harness = false

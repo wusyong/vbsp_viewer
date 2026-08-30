@@ -1,0 +1,20 @@
+[package]
+name = "qbsp_macros"
+
+version = "0.14.1"
+description = "Rust crate for parsing and operating with Quake 1, 2, and GoldSrc BSP files"
+edition = "2024"
+authors = ["Noxmore"]
+repository = "https://github.com/Noxmore/qbsp"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = [ "extra-traits" ] }
+
+[dev-dependencies]
+qbsp = { path = ".." }

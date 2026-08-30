@@ -1,0 +1,8 @@
+.DS_Store
+target
+*.bench
+*.obj
+result
+.direnv
+*.log
+*.vmf

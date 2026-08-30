@@ -1,0 +1,42 @@
+---
+source: tests/parse.rs
+expression: patched
+---
+{
+  "lightmappedgeneric": {
+    "$basetexture": "cp_mountainlab/concrete/concretefloor003",
+    "$decal": false,
+    "$detail": "overlays/detail001",
+    "$surfaceprop": null,
+    "$basetexturetransform": "center 0.5 0.5 scale 1 1 rotate 0 translate 0 0",
+    "$color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "$decalscale": 1.0,
+    "$detailscale": [
+      1.9,
+      1.9
+    ],
+    "$detailblendfactor": 1.0,
+    "$detailblendmode": 0,
+    "$modelmaterial": null,
+    "$pointsamplemagfilter": false,
+    "$seamless_scale": 1.0,
+    "$alpha": 1.0,
+    "$alphatest": false,
+    "$alphatestreference": 1.0,
+    "$distancealpha": false,
+    "$nocull": false,
+    "$translucent": false,
+    "$bumpmap": "concrete/concretefloor007b_height-ssbump",
+    "$lightwarptexture": null,
+    "$selfillum": false,
+    "$ssbump": false,
+    "$envmap": null,
+    "$phong": 0.0,
+    "$nofog": false,
+    "$ignorez": false
+  }
+}

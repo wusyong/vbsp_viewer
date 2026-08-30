@@ -1,0 +1,26 @@
+[package]
+name = "tf2-bevy-viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19.1", features = ["dynamic_linking"] }
+image = "0.25"
+tf-asset-loader = "0.2"
+# Vendored at ../vbsp: eira-fransham's fork of icewind/vbsp 0.9.1. Upstream has
+# been dormant since May 2025 and never exposed the lighting lump; the fork adds
+# `lightmap_data`, `Face::lightmap_uvs()` and `Bsp::compute_lightmap_atlas_rgb32f`,
+# which is all of milestone 1.4's input. MIT, same as upstream.
+#
+# Moved to glam 0.32 to match bevy 0.19, so its `Vec3`/`Vec2` are now bevy's own
+# types rather than a second, incompatible copy. `geometry::to_bevy` still
+# exists, but it is only the Z-up/Y-up permutation and the unit scale now, not
+# a crate-version shim -- and `glam` is no longer a direct dependency here.
+vbsp = { path = "../vbsp" }
+# The lightmap packer. Vendored alongside vbsp, which depends on the same path,
+# so the two copies are one package and `compute_lightmap_atlas_rgb32f` accepts
+# our packer. (As git deps this needed care: a `rev` on one and not the other
+# makes them *different sources* to Cargo, and the types would not unify.)
+qbsp = { path = "../qbsp" }
+vmt-parser = { path = "../vmt-parser" }
+vtf = "0.3"

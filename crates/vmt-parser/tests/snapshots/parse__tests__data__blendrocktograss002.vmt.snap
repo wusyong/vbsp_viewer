@@ -1,0 +1,45 @@
+---
+source: tests/parse.rs
+expression: result
+---
+{
+  "worldvertextransition": {
+    "$basetexture": "cp_mountainlab/nature/rockwall001",
+    "$basetexture2": "cp_mountainlab/nature/grass001",
+    "$blendmodulatetexture": "nature/grass_blendmask",
+    "$decal": false,
+    "$detail": null,
+    "$surfaceprop": "dirt",
+    "$basetexturetransform": "center 0.5 0.5 scale 1 1 rotate 0 translate 0 0",
+    "$color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "$decalscale": 1.0,
+    "$detailscale": [
+      4.0,
+      4.0
+    ],
+    "$detailblendfactor": 1.0,
+    "$detailblendmode": 1,
+    "$modelmaterial": null,
+    "$pointsamplemagfilter": false,
+    "$seamless_scale": 1.0,
+    "$alpha": 1.0,
+    "$alphatest": false,
+    "$alphatestreference": 1.0,
+    "$distancealpha": false,
+    "$nocull": false,
+    "$translucent": false,
+    "$bumpmap": "nature/rockwall009_height-ssbump",
+    "$bumpmap2": null,
+    "$lightwarptexture": null,
+    "$selfillum": false,
+    "$ssbump": true,
+    "$envmap": null,
+    "$phong": 0.0,
+    "$nofog": false,
+    "$ignorez": false
+  }
+}
