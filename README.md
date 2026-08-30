@@ -131,17 +131,55 @@ generation does.
 shimmer in motion. VTFs carry the full chain, and `get_offset` takes a mip index,
 so this is a contained fix rather than a design problem.
 
+## The vbsp fork
+
+We depend on [`eira-fransham/vbsp`](https://github.com/eira-fransham/vbsp),
+pinned to a rev, rather than crates.io `vbsp` 0.9.1. It is MIT, forked from
+exactly that tag.
+
+**Upstream is dormant** — its last code change was 2025-04-19, with only workflow
+commits since. So this is not "fork risk versus a maintained upstream"; upstream
+is stale either way, and the fork is the living line.
+
+It supplies what upstream withholds, all of which is 1.4's input:
+`Bsp::lightmap_data`, `Face::lightmap_uvs()`,
+`Bsp::compute_lightmap_atlas_rgb32f()`, HDR lighting, leaf ambient lighting (for
+props in Phase 2) and displacement lightmap sample positions. Upstream exposes
+every *index* into the lightmap and none of the bytes: `mod bspfile` is private,
+so `BspFile`/`LumpType`/`get_lump` are unreachable, and `Bsp::header` is only
+`{ version }` with no lump table.
+
+**It also unified triangulation**, which is why `push_face` is one path rather
+than two. Upstream's `vertex_positions()` returns a pre-triangulated soup; the
+fork's returns the face's own vertices (polygon corners, or the displaced grid)
+with `triangulate_indices()` giving indices into them. Migrating dropped vertex
+count from 135,597 to 85,597 — a 37% saving, all of it displacements that were
+previously duplicated per triangle.
+
+**The one real wart**: it tracks glam 0.30 while Bevy 0.19 is on 0.32. Both get
+linked, and its `Vec3`/`Vec2` are distinct types from Bevy's, so everything
+crossing the boundary converts componentwise. `SourceVec3` is aliased in
+`geometry.rs` so this reads as a deliberate boundary rather than a baffling
+"expected `Vec3`, found `Vec3`".
+
+### What the migration did and didn't change
+
+Identical: 232 batches, 63,783 triangles, 14,879 faces, 232 displaced, and the
+cross-check still at 49 mismatches / 45 strong — which is the evidence the
+triangulation swap was clean.
+
+Changed: vertices 135,597 → 85,597, and `side set on` 5,795 → 5,830. The latter
+is not a regression — the counter used to sit after an early `return` in the
+displacement branch, so it never counted displaced faces. 35 of the 232 have
+`side` set.
+
 ## Notes for later milestones
 
-**1.4 (lightmaps) is blocked on `vbsp` and has no reference implementation.**
-`Bsp` has no `lighting` field; `LumpType::Lighting` and `LightingHdr` exist but
-are never read; `mod bspfile` is private, so `BspFile`, `LumpType` and
-`get_lump` are unreachable; and `Bsp::header` is only `{ version }`, with no
-lump table. Face-side data is all public (`light_offset`,
-`light_map_texture_min`/`_size`, `styles`) — everything except the bytes.
-Neither vbspview nor vbsp-to-gltf touches lightmaps at all.
-
-The workaround is a side-parser: read the 8 + 64×16 lump table off the raw bytes
-and LZMA-decompress lump 8. TF2 compresses lumps — the models and entity lumps of
-ctf_2fort both start with `LZMA` magic, and the lump header's `fourCC` field
-holds the uncompressed size rather than a code. Worth an upstream PR.
+`bevy_bsp`/`bevy_vpk` ([eira-fransham](https://github.com/eira-fransham/bevy_vbsp),
+and [kristoff3r](https://github.com/kristoff3r/bevy_vbsp), which is a fork of it
+and further along) are the reason the vbsp fork and qbsp's lightmap packer exist.
+**Neither repo carries a license** — no LICENSE file, no `license` field on
+either crate — so they are all-rights-reserved and cannot be copied from. They
+remain useful as a design reference for the Bevy side of 1.4: the
+`bevy::pbr::Lightmap` component, per-`LightmapStyle` atlases, and ASTC
+compression of the atlas.

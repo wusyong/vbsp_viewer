@@ -17,7 +17,12 @@ use std::time::{Duration, Instant};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use vbsp::{Bsp, Face, Handle, TextureInfo, Vector};
+use vbsp::{Bsp, Face, Handle, TextureInfo};
+
+/// vbsp's glam, which is 0.30 against bevy's 0.32 — a different crate version,
+/// so a different `Vec3`. Aliased so the conversion boundary is visible rather
+/// than a confusing "expected Vec3, found Vec3".
+use glam::Vec3 as SourceVec3;
 
 /// 1 Hammer unit = 1 inch. This puts 2fort at ~120 m end to end and a doorway at
 /// human height, which is the check that matters. Both of icewind's tools use
@@ -33,13 +38,13 @@ pub const REFERENCE_YAW: f32 = std::f32::consts::FRAC_PI_2;
 /// winding alone. The roadmap's `(x, z, -y)` mirrors instead, which is why that
 /// route then needs every index list reversed to compensate.
 #[inline]
-pub fn to_bevy(v: Vector) -> Vec3 {
+pub fn to_bevy(v: SourceVec3) -> Vec3 {
     Vec3::new(v.y, v.z, v.x) * HAMMER_UNIT
 }
 
 /// Same permutation without the unit scale, for directions.
 #[inline]
-fn dir_to_bevy(v: Vector) -> Vec3 {
+fn dir_to_bevy(v: SourceVec3) -> Vec3 {
     Vec3::new(v.y, v.z, v.x)
 }
 
@@ -47,7 +52,7 @@ fn dir_to_bevy(v: Vector) -> Vec3 {
 /// brush entities.
 pub struct BrushModel {
     pub index: usize,
-    pub origin: Vector,
+    pub origin: SourceVec3,
     pub classname: String,
 }
 
@@ -62,7 +67,7 @@ pub struct BrushModel {
 pub fn brush_models(bsp: &Bsp) -> Vec<BrushModel> {
     let mut models = vec![BrushModel {
         index: 0,
-        origin: Vector::default(),
+        origin: SourceVec3::ZERO,
         classname: "worldspawn".into(),
     }];
 
@@ -80,11 +85,12 @@ pub fn brush_models(bsp: &Bsp) -> Vec<BrushModel> {
         models.push(BrushModel {
             index,
             // Most brush entities are already in world space; a few carry an
-            // origin, so honour it where present.
+            // origin, so honour it where present. The fork dropped its `Vector`
+            // type, but the blanket `[T; N]` impl parses the same "x y z".
             origin: entity
-                .prop_parse::<Vector>("origin")
+                .prop_parse::<[f32; 3]>("origin")
                 .and_then(Result::ok)
-                .unwrap_or_default(),
+                .map_or(SourceVec3::ZERO, SourceVec3::from_array),
             classname: entity.prop("classname").unwrap_or("?").to_string(),
         });
     }
@@ -197,49 +203,45 @@ pub fn build(bsp: &Bsp) -> (Vec<Batch>, Stats) {
     (batches, stats)
 }
 
+
+/// Append one face to its batch.
+///
+/// This used to be two paths -- a polygon fan for brush faces and a
+/// pre-triangulated soup for displacements. The vbsp fork unified them:
+/// `vertex_positions()` yields the face's own vertices either way (polygon
+/// corners, or the displaced grid) and `triangulate_indices()` yields indices
+/// into exactly that list, dispatching on displacement internally. So there is
+/// one path now, and it is indexed rather than a soup.
 fn push_face(
     accum: &mut Accum,
     face: &Handle<Face>,
     texture: &Handle<TextureInfo>,
-    origin: Vector,
+    origin: SourceVec3,
     stats: &mut Stats,
 ) {
     let base = accum.positions.len() as u32;
-
-    if face.displacement().is_some() {
+    let displaced = face.displacement().is_some();
+    if displaced {
         stats.faces_displaced += 1;
-        // Displaced vertices arrive already triangulated, as a soup rather than
-        // a polygon, so the indices are just sequential.
-        let first = accum.positions.len();
-        for pos in face.vertex_positions() {
-            // UVs must be computed in Source space -- the texture vectors are a
-            // dot product against the unconverted position. Convert after.
-            accum.uvs.push(texture.uv(pos));
-            accum.positions.push(to_bevy(pos + origin).to_array());
-        }
-        let added = accum.positions.len() - first;
+    }
 
-        // The plane normal belongs to the flat base quad and is wrong the moment
-        // the surface is displaced, so derive one per triangle instead.
-        for tri in 0..added / 3 {
-            let i = first + tri * 3;
-            let [a, b, c] = [
-                Vec3::from(accum.positions[i]),
-                Vec3::from(accum.positions[i + 1]),
-                Vec3::from(accum.positions[i + 2]),
-            ];
-            let normal = (b - a).cross(c - a).normalize_or_zero().to_array();
-            accum.normals.extend([normal; 3]);
-            let i = i as u32;
-            accum.indices.extend([i, i + 1, i + 2]);
-        }
+    let first = accum.positions.len();
+    for pos in face.vertex_positions() {
+        // UVs must be computed in Source space -- the texture vectors are a dot
+        // product against the unconverted position. Convert after.
+        accum.uvs.push(texture.uv(pos).to_array());
+        accum.positions.push(to_bevy(pos + origin).to_array());
+    }
+    if accum.positions.len() - first < 3 {
+        accum.positions.truncate(first);
+        accum.uvs.truncate(first);
         return;
     }
 
-    let positions: Vec<Vector> = face.vertices().map(|v| v.position).collect();
-    if positions.len() < 3 {
-        return;
-    }
+    let index_start = accum.indices.len();
+    accum
+        .indices
+        .extend(face.triangulate_indices().map(|i| base + i as u32));
 
     // Taking the normal from the face's plane is exact and free; vbspview
     // recomputes normals from the triangles instead, which costs a pass and
@@ -249,42 +251,59 @@ fn push_face(
     // name is. `side` records which side of the plane the face sits on for the
     // BSP tree's benefit; the surfedge walk is already wound to the face's true
     // facing, so the plane normal needs no correction. Measured on ctf_2fort:
-    // flipping on `side` disagrees with the winding on 5508 of 14879 faces,
-    // leaving it alone disagrees on 49.
-    let normal = dir_to_bevy(face.normal()).normalize_or_zero();
+    // flipping on `side` disagreed with the winding on 5508 of 14879 faces,
+    // leaving it alone disagreed on 49.
+    let plane_normal = dir_to_bevy(face.normal()).normalize_or_zero();
     if face.side != 0 {
         stats.faces_side_set += 1;
     }
 
-    for pos in &positions {
-        accum.uvs.push(texture.uv(*pos));
-        accum.positions.push(to_bevy(*pos + origin).to_array());
-        accum.normals.push(normal.to_array());
+    if displaced {
+        // The plane normal belongs to the flat base quad and is wrong the moment
+        // the surface is displaced, so derive one per triangle. Vertices are
+        // shared across the displacement grid, so accumulate and normalise
+        // rather than assigning -- that also smooths the terrain for free.
+        accum.normals.resize(accum.positions.len(), [0.0; 3]);
+        for tri in accum.indices[index_start..].as_chunks::<3>().0 {
+            let [a, b, c] = [
+                Vec3::from(accum.positions[tri[0] as usize]),
+                Vec3::from(accum.positions[tri[1] as usize]),
+                Vec3::from(accum.positions[tri[2] as usize]),
+            ];
+            // Un-normalised, so larger triangles weigh more.
+            let face_normal = (b - a).cross(c - a);
+            for &i in tri {
+                let n = &mut accum.normals[i as usize];
+                *n = (Vec3::from(*n) + face_normal).to_array();
+            }
+        }
+        for i in first..accum.positions.len() {
+            accum.normals[i] = Vec3::from(accum.normals[i]).normalize_or_zero().to_array();
+        }
+        return;
     }
 
-    // Faces are convex polygons, so a fan is enough. vbsp's own `triangulate()`
-    // emits `[c, b, a]` -- the reverse of the surfedge walk -- and the reference
-    // glb renders correctly with that order, so mirror it here.
-    for i in 1..positions.len() - 1 {
-        let i = i as u32;
-        accum.indices.extend([base + i + 1, base + i, base]);
-    }
+    accum
+        .normals
+        .resize(accum.positions.len(), plane_normal.to_array());
 
     // Cross-check the plane normal against the winding of the first emitted
-    // triangle, which is `[base + 2, base + 1, base]`. This is the cheapest way
-    // to catch a wrong coordinate mapping, a wrong fan order or a wrong normal
-    // rule, and it is what caught the `side` mistake above.
+    // triangle. This is the cheapest way to catch a wrong coordinate mapping, a
+    // wrong fan order or a wrong normal rule, and it is what caught the `side`
+    // mistake above.
+    let Some(tri) = accum.indices.get(index_start..index_start + 3) else {
+        return;
+    };
     let [a, b, c] = [
-        Vec3::from(accum.positions[base as usize + 2]),
-        Vec3::from(accum.positions[base as usize + 1]),
-        Vec3::from(accum.positions[base as usize]),
+        Vec3::from(accum.positions[tri[0] as usize]),
+        Vec3::from(accum.positions[tri[1] as usize]),
+        Vec3::from(accum.positions[tri[2] as usize]),
     ];
-    let wound = (b - a).cross(c - a).normalize_or_zero();
-    let agreement = wound.dot(normal);
+    let agreement = (b - a).cross(c - a).normalize_or_zero().dot(plane_normal);
     if agreement < 0.0 {
         stats.normal_mismatches += 1;
         // Split the residual: a genuinely backwards face reads about -1, while a
-        // sliver whose first fan triangle is nearly degenerate reads near 0 and
+        // sliver whose first triangle is nearly degenerate reads near 0 and
         // means nothing.
         if agreement < -0.5 {
             stats.normal_mismatches_strong += 1;

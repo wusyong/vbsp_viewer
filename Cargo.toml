@@ -7,9 +7,20 @@ edition = "2024"
 bevy = { version = "0.19.1", features = ["dynamic_linking"] }
 image = "0.25"
 tf-asset-loader = "0.2"
-# Parses the BSP itself. Note it does not expose the lighting lump, so
-# milestone 1.4 will need a side-parser for lump 8.
-vbsp = "0.9"
+# Fork of icewind/vbsp 0.9.1, pinned. Upstream has been dormant since May 2025
+# and never exposed the lighting lump; this fork adds `lightmap_data`,
+# `Face::lightmap_uvs()` and `Bsp::compute_lightmap_atlas_rgb32f`, which is all
+# of milestone 1.4's input. MIT, same as upstream.
+#
+# Caveat: it tracks glam 0.30 while bevy 0.19 is on glam 0.32, so both are
+# linked and its `Vec3`/`Vec2` are distinct types from bevy's. Everything
+# crossing that boundary converts componentwise -- see `geometry::to_bevy`.
+# TODO: we should vendro vbsp ourselves.
+vbsp = { git = "https://github.com/eira-fransham/vbsp", rev = "cd1711720be854654be7708fec44b2b11fc08424" }
+# vbsp does not re-export its glam, and it is a different major from bevy's,
+# so name it explicitly rather than let the mismatch surface as a baffling
+# "expected Vec3, found Vec3".
+glam = "0.30"
 vmt-parser = "0.2"
 vtf = "0.3"
 

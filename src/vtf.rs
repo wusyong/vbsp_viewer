@@ -61,7 +61,10 @@ pub fn to_image(data: &[u8], supports_bc: bool) -> Result<Image, String> {
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
-        ..ImageSamplerDescriptor::default()
+        // Anisotropy needs a mip chain to do its job, and we upload only mip 0
+        // so far -- harmless now, and correct once mips land.
+        anisotropy_clamp: 16,
+        ..ImageSamplerDescriptor::linear()
     });
 
     Ok(image)
