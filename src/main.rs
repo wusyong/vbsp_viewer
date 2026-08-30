@@ -11,6 +11,9 @@
 //! deciding in the abstract whether a wall is in the right place.
 
 mod bsp;
+mod vfs;
+mod vmt;
+mod vtf;
 
 use std::f32::consts::FRAC_PI_2;
 
@@ -55,11 +58,39 @@ impl View {
 
 #[derive(Resource)]
 struct Toggles {
-    /// Off at startup: see the geometry first, judge winding second.
-    cull: bool,
-    /// Debug colour per texture beats flat white -- a face batched under the
-    /// wrong texture is invisible in white and obvious in colour.
-    debug_color: bool,
+    /// Whether to force backface culling on every batch. Materials set their own
+    /// `cull_mode` from `$nocull`, so this overrides them wholesale; useful for
+    /// bringing geometry up, not something to leave on.
+    cull_override: Option<bool>,
+    surface: Surface,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Surface {
+    Textured,
+    /// Per-texture colour. A face batched under the wrong texture is invisible
+    /// under a real texture and obvious here.
+    DebugColor,
+    /// Isolates geometry problems from material ones.
+    Plain,
+}
+
+impl Surface {
+    fn label(self) -> &'static str {
+        match self {
+            Surface::Textured => "textured",
+            Surface::DebugColor => "per-texture colour",
+            Surface::Plain => "plain",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Surface::Textured => Surface::DebugColor,
+            Surface::DebugColor => Surface::Plain,
+            Surface::Plain => Surface::Textured,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -76,8 +107,14 @@ fn main() {
         // Overridable so `--shot` can capture any combination without a human at
         // the keyboard: `TF2_CULL=1 TF2_PLAIN=1 cargo run -- --shot`.
         .insert_resource(Toggles {
-            cull: flag("TF2_CULL"),
-            debug_color: !flag("TF2_PLAIN"),
+            cull_override: flag("TF2_CULL").then_some(true),
+            surface: if flag("TF2_PLAIN") {
+                Surface::Plain
+            } else if flag("TF2_DEBUG_COLOR") {
+                Surface::DebugColor
+            } else {
+                Surface::Textured
+            },
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -177,10 +214,15 @@ fn input(keys: Res<ButtonInput<KeyCode>>, mut view: ResMut<View>, mut toggles: R
         *view = view.next();
     }
     if keys.just_pressed(KeyCode::KeyC) {
-        toggles.cull = !toggles.cull;
+        // None (materials decide) -> forced on -> forced off -> None.
+        toggles.cull_override = match toggles.cull_override {
+            None => Some(true),
+            Some(true) => Some(false),
+            Some(false) => None,
+        };
     }
     if keys.just_pressed(KeyCode::KeyT) {
-        toggles.debug_color = !toggles.debug_color;
+        toggles.surface = toggles.surface.next();
     }
 }
 
@@ -216,19 +258,25 @@ fn apply_toggles(
         return;
     }
     for (batch, mut current) in &mut batches {
-        let wanted = if toggles.debug_color {
-            &batch.debug
-        } else {
-            &batch.plain
+        let wanted = match toggles.surface {
+            Surface::Textured => &batch.textured,
+            Surface::DebugColor => &batch.debug,
+            Surface::Plain => &batch.plain,
         };
         if current.0 != *wanted {
             current.0 = wanted.clone();
         }
-        bsp::set_culling(
-            &mut materials,
-            &[batch.plain.clone(), batch.debug.clone()],
-            toggles.cull,
-        );
+        if let Some(cull) = toggles.cull_override {
+            bsp::set_culling(
+                &mut materials,
+                &[
+                    batch.textured.clone(),
+                    batch.plain.clone(),
+                    batch.debug.clone(),
+                ],
+                cull,
+            );
+        }
     }
 }
 
@@ -320,16 +368,31 @@ fn report(
     if let Some(error) = &bsp_report.error {
         out.push_str(&format!("BSP LOAD FAILED: {error}\n"));
     }
+    let m = &bsp_report.materials;
     out.push_str(&format!(
-        "[G] view: {}   [C] cull: {}   [T] colour: {}\n",
+        "[G] view: {}   [C] cull: {}   [T] surface: {}\n",
         view.label(),
-        if toggles.cull { "back" } else { "off" },
-        if toggles.debug_color {
-            "per-texture"
-        } else {
-            "plain"
+        match toggles.cull_override {
+            None => "per-material",
+            Some(true) => "forced back",
+            Some(false) => "forced off",
         },
+        toggles.surface.label(),
     ));
+    out.push_str(&format!(
+        "materials: {} ok, {} no texture, {} failed, {} water · {} BC + {} RGBA = {:.0} MB · {:.0} ms\n",
+        m.resolved,
+        m.missing_texture,
+        m.failed,
+        m.water,
+        m.bc_uploaded,
+        m.rgba_uploaded,
+        m.bytes as f32 / (1024.0 * 1024.0),
+        m.load_time.as_secs_f32() * 1000.0,
+    ));
+    for line in &bsp_report.missing {
+        out.push_str(&format!("    ! {line}\n"));
+    }
     out.push_str(&format!(
         "{} batches · {} tris · {} verts · built in {:.0} ms\n",
         bsp_report.batches,

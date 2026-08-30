@@ -5,7 +5,8 @@ same map, toggled at runtime with `G`:
 
 - **Reference** — `ctf_2fort.glb` from `vbsp-to-gltf`. Known-good, textured,
   static. This is what milestone 1.0 established.
-- **BSP** — our own `vbsp` → `Mesh` path (milestone 1.1). Untextured so far.
+- **BSP** — our own `vbsp` → `Mesh` path, textured from the VPKs (1.1 + 1.2).
+  No lightmaps, no props, no sky yet.
 
 Keeping both in one scene is the point. A geometry bug in the BSP path shows up
 as a difference from the reference, which beats deciding in the abstract whether
@@ -17,12 +18,13 @@ a wall is in the right place.
 cargo run                              # interactive, BSP view
 cargo run -- --shot                    # capture shot.png after 8 s, then quit
 TF2_BSP=/path/to/map.bsp cargo run     # a different map
-TF2_CAM=-20,18,55 cargo run            # start position, metres, Bevy axes
+TF2_CAM=0,16,45 cargo run              # start position, metres, Bevy axes
 TF2_CULL=1 TF2_PLAIN=1 cargo run       # initial toggle state, for --shot
 ```
 
-`G` cycles BSP / reference / both · `C` backface culling · `T` per-texture debug
-colour vs plain · RMB look · WASD/QE move · Shift sprint · `[` `]` speed.
+`G` cycles BSP / reference / both · `C` cycles culling per-material / forced on /
+forced off · `T` cycles textured / per-texture colour / plain · RMB look ·
+WASD/QE move · Shift sprint · `[` `]` speed.
 
 The BSP is read from the TF2 install directly, so there is no asset step for the
 BSP view. The reference view needs the glb:
@@ -86,14 +88,50 @@ Displacements appear to come free: `vbsp`'s `vertex_positions()` already returns
 displaced, triangulated vertices, and 232 faces take that path. Worth confirming
 against the reference before calling 1.3 done.
 
-## Notes for later milestones
+## Milestone 1.2 — textures
 
-**1.2 (materials) is probably cheaper than budgeted.** `tf-asset-loader` with
-its `bsp` feature does the search-path walking the roadmap describes, and
-vbspview mounts the map's own pakfile ahead of everything else in one line:
-`loader.add_source(bsp.pack.clone().into_zip())`. vbspview's `material.rs` is
-also the better VMT reference — it wires the bump map up as a normal map, which
-`vbsp-to-gltf` decodes and then silently drops.
+`226 materials, 0 failed · 225 BC + 1 RGBA = 88 MB · 120 ms`
+
+Three modules: [vfs.rs](src/vfs.rs) (search path), [vmt.rs](src/vmt.rs)
+(materials), [vtf.rs](src/vtf.rs) (textures).
+
+**DXT blocks go to the GPU untouched.** DXT1/3/5 are bit-identical to BC1/2/3, so
+`get_frame(0)` is uploaded as-is wherever the adapter reports
+`TEXTURE_COMPRESSION_BC`, with a CPU decode as fallback. This is not a
+micro-optimisation: 88 MB against roughly 900 MB if everything were decoded to
+RGBA8. Both reference tools decode, and `vbsp-to-gltf` then re-encodes to PNG,
+which is how 22 MB of BSP becomes a 172 MB glb.
+
+**The pakfile is searched first**, ahead of the install, which is how a custom map
+overrides stock content. `tf-asset-loader`'s `add_source` *appends*, so mounting
+it that way puts it last — vbspview has this backwards. Keeping it as a separate
+field also sidesteps a version split: `tf-asset-loader`'s `bsp` feature pins vbsp
+0.8.2, which cannot coexist with our 0.9.
+
+**Two things the search path needed that `tf-asset-loader` does not do.** Its
+`clean_path` only resolves `../`; the lowercase retry in `load` handles case, but
+backslashes are left alone, and VMTs use both separators. Normalising both before
+the lookup is the whole fix.
+
+**`ImageAddressMode::Repeat` is mandatory.** Source computes UVs as a dot product
+of world position against texture size, so a long wall runs to `u = 40`. Bevy
+defaults to `ClampToEdge`, which turns every surface into one smeared edge pixel.
+
+Materials are **unlit** on purpose. Without lightmaps the only light available is
+a single directional, which reads worse than flat albedo and hides texture
+problems in shadow. Flat is the honest intermediate state; 1.4 is what makes it
+look like TF2.
+
+`$bumpmap` is deliberately *not* collected. A normal map needs per-vertex
+tangents and the BSP has none, so storing it would mean decoding a texture that
+is never read — exactly what `vbsp-to-gltf` does. It goes in when tangent
+generation does.
+
+**Known gap: no mipmaps.** Only mip 0 is uploaded, so distant surfaces will
+shimmer in motion. VTFs carry the full chain, and `get_offset` takes a mip index,
+so this is a contained fix rather than a design problem.
+
+## Notes for later milestones
 
 **1.4 (lightmaps) is blocked on `vbsp` and has no reference implementation.**
 `Bsp` has no `lighting` field; `LumpType::Lighting` and `LightingHdr` exist but

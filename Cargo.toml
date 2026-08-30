@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19.1", features = ["dynamic_linking"] }
+image = "0.25"
+tf-asset-loader = "0.2"
 # Parses the BSP itself. Note it does not expose the lighting lump, so
 # milestone 1.4 will need a side-parser for lump 8.
 vbsp = "0.9"
+vmt-parser = "0.2"
+vtf = "0.3"
 
 [profile.dev]
 opt-level = 1
