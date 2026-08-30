@@ -5908,6 +5908,7 @@ dependencies = [
  "bevy",
  "glam 0.30.10",
  "image",
+ "qbsp",
  "tf-asset-loader",
  "vbsp",
  "vmt-parser",

@@ -19,6 +19,8 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use vbsp::{Bsp, Face, Handle, TextureInfo};
 
+use super::lightmap::Lightmaps;
+
 /// vbsp's glam, which is 0.30 against bevy's 0.32 — a different crate version,
 /// so a different `Vec3`. Aliased so the conversion boundary is visible rather
 /// than a confusing "expected Vec3, found Vec3".
@@ -118,6 +120,9 @@ pub struct Stats {
     /// Faces rejected by `is_visible()`: NODRAW, SKIP, HINT, TRIGGER and SKY.
     pub faces_skipped: usize,
     pub faces_displaced: usize,
+    /// Faces that got a real lightmap patch. The rest sample the atlas's neutral
+    /// texel and render unlit.
+    pub faces_lit: usize,
     pub triangles: usize,
     pub vertices: usize,
     /// Faces whose plane normal disagrees with the normal implied by their
@@ -140,10 +145,15 @@ struct Accum {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
+    /// Second UV set, already remapped into atlas space. Bevy's `Lightmap`
+    /// component carries a `uv_rect` for exactly this job, but it is per-entity
+    /// and we batch hundreds of faces into one entity, so the remap is baked in
+    /// here instead and `uv_rect` stays the full 0..1.
+    lightmap_uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
 }
 
-pub fn build(bsp: &Bsp) -> (Vec<Batch>, Stats) {
+pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
     let start = Instant::now();
     let mut stats = Stats::default();
 
@@ -160,7 +170,9 @@ pub fn build(bsp: &Bsp) -> (Vec<Batch>, Stats) {
         let Some(model) = bsp.models().nth(placement.index) else {
             continue;
         };
-        for face in model.faces() {
+        // `faces_with_id` rather than `faces`: the lightmap rects are keyed on
+        // the global face index, which is what the id is.
+        for (face_id, face) in model.faces_with_id() {
             if !face.is_visible() {
                 stats.faces_skipped += 1;
                 continue;
@@ -173,7 +185,11 @@ pub fn build(bsp: &Bsp) -> (Vec<Batch>, Stats) {
                     debug_color: texture.debug_color(),
                     ..default()
                 });
-            push_face(accum, &face, &texture, placement.origin, &mut stats);
+            let patch = lightmaps.uv_rect(face_id);
+            if patch.is_some() {
+                stats.faces_lit += 1;
+            }
+            push_face(accum, &face, &texture, placement.origin, patch, &mut stats);
             stats.faces_drawn += 1;
         }
     }
@@ -193,6 +209,7 @@ pub fn build(bsp: &Bsp) -> (Vec<Batch>, Stats) {
                     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, a.positions)
                     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, a.normals)
                     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, a.uvs)
+                    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, a.lightmap_uvs)
                     .with_inserted_indices(Indices::U32(a.indices)),
             }
         })
@@ -217,6 +234,7 @@ fn push_face(
     face: &Handle<Face>,
     texture: &Handle<TextureInfo>,
     origin: SourceVec3,
+    patch: Option<(Vec2, Vec2)>,
     stats: &mut Stats,
 ) {
     let base = accum.positions.len() as u32;
@@ -232,11 +250,31 @@ fn push_face(
         accum.uvs.push(texture.uv(pos).to_array());
         accum.positions.push(to_bevy(pos + origin).to_array());
     }
+    // `lightmap_uvs` runs 0..1 across this face's own patch; scale into the
+    // patch's slot in the atlas. A face with no patch is parked at the atlas
+    // origin, which the packer fills with the neutral colour, so it renders at
+    // full albedo rather than black.
+    match patch {
+        Some((min, size)) => accum.lightmap_uvs.extend(
+            face.lightmap_uvs()
+                .map(|uv| (min + size * Vec2::new(uv.x, uv.y)).to_array()),
+        ),
+        None => accum
+            .lightmap_uvs
+            .resize(accum.positions.len(), [0.0, 0.0]),
+    }
+
     if accum.positions.len() - first < 3 {
         accum.positions.truncate(first);
         accum.uvs.truncate(first);
+        accum.lightmap_uvs.truncate(first);
         return;
     }
+    // A displacement's lightmap grid and its vertex grid can disagree by a row
+    // in malformed maps; pad rather than desync the attribute arrays.
+    accum
+        .lightmap_uvs
+        .resize(accum.positions.len(), [0.0, 0.0]);
 
     let index_start = accum.indices.len();
     accum

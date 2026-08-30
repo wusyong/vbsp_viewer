@@ -5,8 +5,8 @@ same map, toggled at runtime with `G`:
 
 - **Reference** — `ctf_2fort.glb` from `vbsp-to-gltf`. Known-good, textured,
   static. This is what milestone 1.0 established.
-- **BSP** — our own `vbsp` → `Mesh` path, textured from the VPKs (1.1 + 1.2).
-  No lightmaps, no props, no sky yet.
+- **BSP** — our own `vbsp` → `Mesh` path: textured from the VPKs and lit by the
+  map's baked lightmaps (1.1–1.4). No props and no sky yet.
 
 Keeping both in one scene is the point. A geometry bug in the BSP path shows up
 as a difference from the reference, which beats deciding in the abstract whether
@@ -20,11 +20,12 @@ cargo run -- --shot                    # capture shot.png after 8 s, then quit
 TF2_BSP=/path/to/map.bsp cargo run     # a different map
 TF2_CAM=0,16,45 cargo run              # start position, metres, Bevy axes
 TF2_CULL=1 TF2_PLAIN=1 cargo run       # initial toggle state, for --shot
+TF2_LIGHTMAP_EXPOSURE=8 cargo run      # lightmap brightness (default 20)
 ```
 
 `G` cycles BSP / reference / both · `C` cycles culling per-material / forced on /
-forced off · `T` cycles textured / per-texture colour / plain · RMB look ·
-WASD/QE move · Shift sprint · `[` `]` speed.
+forced off · `T` cycles textured / per-texture colour / plain · `-` `=` lightmap
+exposure · RMB look · WASD/QE move · Shift sprint · `[` `]` speed.
 
 The BSP is read from the TF2 install directly, so there is no asset step for the
 BSP view. The reference view needs the glb:
@@ -84,10 +85,6 @@ of each face's first triangle, reported in the HUD. It is what caught the `side`
 mistake. **Known residual: 45 faces are genuinely backwards** (0.3%), not
 numerical noise — unexplained, and not chased down at this milestone.
 
-Displacements appear to come free: `vbsp`'s `vertex_positions()` already returns
-displaced, triangulated vertices, and 232 faces take that path. Worth confirming
-against the reference before calling 1.3 done.
-
 ## Milestone 1.2 — textures
 
 `226 materials, 0 failed · 225 BC + 1 RGBA = 88 MB · 120 ms`
@@ -117,10 +114,10 @@ the lookup is the whole fix.
 of world position against texture size, so a long wall runs to `u = 40`. Bevy
 defaults to `ClampToEdge`, which turns every surface into one smeared edge pixel.
 
-Materials are **unlit** on purpose. Without lightmaps the only light available is
-a single directional, which reads worse than flat albedo and hides texture
-problems in shadow. Flat is the honest intermediate state; 1.4 is what makes it
-look like TF2.
+Materials were **unlit** at this milestone, on purpose: with no lightmaps the
+only light available was a single directional, which reads worse than flat albedo
+and hides texture problems in shadow. 1.4 turned that off — see below, and note
+that Bevy silently ignores a `Lightmap` on an unlit material.
 
 `$bumpmap` is deliberately *not* collected. A normal map needs per-vertex
 tangents and the BSP has none, so storing it would mean decoding a texture that
@@ -130,6 +127,56 @@ generation does.
 **Known gap: no mipmaps.** Only mip 0 is uploaded, so distant surfaces will
 shimmer in motion. VTFs carry the full chain, and `get_offset` takes a mip index,
 so this is a contained fix rather than a design problem.
+
+## Milestone 1.3 — displacements
+
+Free, as suspected. 232 faces take the displacement path through
+`vertex_positions()`, and after the fork migration they are indexed with
+smoothed vertex normals (visible as a smoothly shaded cliff face in the `plain`
+view) and they lightmap correctly.
+
+One open question, deferred to 1.5: base-texture UVs on displacements are
+projected from the *displaced* position, where Source interpolates the base
+face's corner UVs across the grid. On steep displacements that shows as slight
+stretching.
+
+## Milestone 1.4 — lightmaps
+
+`2044x1393 atlas · 1 style · 14,662 patches, 1,129 without · 43 MB · 95 ms`
+
+[lightmap.rs](src/bsp/lightmap.rs) is the shortest module in the project and the
+longest task in the roadmap, because the vbsp fork does the hard part:
+`compute_lightmap_atlas_rgb32f` decodes every face's RGBE patch and packs them
+into one atlas, returning a per-face pixel rect.
+
+**The atlas remap is baked into `UV_1`, not left to Bevy.** `Lightmap.uv_rect`
+exists for exactly this, but it is per-*entity* and we batch hundreds of faces
+per entity, so one rect cannot describe them. Each face's `lightmap_uvs()` (0..1
+across its own patch) is scaled into its atlas slot at mesh-build time and
+`uv_rect` stays the full 0..1.
+
+**The atlas is `Rgba32Float`.** Source stores RGBE and the shared exponent
+routinely pushes values past 1.0, so an 8-bit target would clip every bright
+surface. That costs 43 MB, which is worth it; `Rgba16Float` would halve it if
+that ever matters.
+
+**Materials had to stop being `unlit`.** They were unlit through 1.2 because
+there was nothing to light them with. The failure mode if you forget is "nothing
+changed on screen" rather than an error — Bevy silently ignores the `Lightmap`
+component on an unlit material.
+
+**Exposure is eyeballed and has no principled value.** Source bakes against its
+own light units; Bevy's PBR expects something else. `20.0` was found by sweeping
+— 1 is dim but legible, 200 washes out, 4000 is pure white. `-`/`=` adjust it
+live and `TF2_LIGHTMAP_EXPOSURE` overrides it, because a hand-tuned constant
+deserves a knob.
+
+**Known gaps.** Only style 0 is used: `LightmapStyle` keys one atlas per
+switchable-light state, and compositing them at runtime is deferred (neither
+existing Source viewer does it either). 1,129 faces have no patch and sample the
+atlas's neutral texel, rendering at full albedo. Indoor lighting reads better
+than outdoor at a single global exposure, which is inherent to one constant over
+HDR data.
 
 ## The vbsp fork
 

@@ -8,10 +8,12 @@
 //! that an `AssetReader` would be built on, so that door stays open.
 
 pub mod geometry;
+pub mod lightmap;
 
 use std::path::PathBuf;
 
 use bevy::math::Affine2;
+use bevy::pbr::Lightmap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Face as CullFace, WgpuFeatures};
 use bevy::render::renderer::RenderDevice;
@@ -19,6 +21,21 @@ use bevy::render::renderer::RenderDevice;
 use crate::vfs::Vfs;
 
 pub use geometry::{HAMMER_UNIT, REFERENCE_YAW, Stats};
+pub use lightmap::LightmapStats;
+
+/// Source bakes lightmaps against its own light units; Bevy's PBR pipeline
+/// expects something else. There is no principled conversion between them, so
+/// this is tuned by eye — `TF2_LIGHTMAP_EXPOSURE` overrides it, and `-`/`=`
+/// adjust it live, which is how the default was found.
+pub fn lightmap_exposure() -> f32 {
+    std::env::var("TF2_LIGHTMAP_EXPOSURE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_LIGHTMAP_EXPOSURE)
+}
+
+/// Found by sweeping: 1 is dim but legible, 200 washes out, 4000 is pure white.
+pub const DEFAULT_LIGHTMAP_EXPOSURE: f32 = 20.0;
 
 /// Where to find the map. Defaults to a stock Windows Steam install; override
 /// with `TF2_BSP=/path/to/map.bsp` for custom maps or a different library.
@@ -66,6 +83,7 @@ pub struct MaterialStats {
 pub struct BspReport {
     pub stats: Stats,
     pub materials: MaterialStats,
+    pub lightmaps: LightmapStats,
     /// Texture names that did not resolve, for the HUD. Capped — with a broken
     /// search path this would otherwise be every material in the map.
     pub missing: Vec<String>,
@@ -123,7 +141,23 @@ fn load_bsp(
         }
     };
 
-    let (batches, stats) = geometry::build(&bsp);
+    // Before geometry: the atlas decides each face's second UV set.
+    let (lightmaps, lightmap_stats) = lightmap::build(&bsp, &mut images);
+    if let Some(e) = lightmap_stats.error {
+        warn!("no lightmaps: {e}");
+    } else {
+        info!(
+            "lightmap atlas {}x{}, {} styles, {:.0} MB in {:?}",
+            lightmap_stats.atlas.x,
+            lightmap_stats.atlas.y,
+            lightmap_stats.styles,
+            lightmap_stats.bytes as f32 / (1024.0 * 1024.0),
+            lightmap_stats.build_time,
+        );
+    }
+    report.lightmaps = lightmap_stats;
+
+    let (batches, stats) = geometry::build(&bsp, &lightmaps);
     info!(
         "built {} batches, {} triangles from {} faces in {:?}",
         batches.len(),
@@ -187,7 +221,7 @@ fn load_bsp(
             ..default()
         });
         let textured = materials.add(textured);
-        commands.spawn((
+        let mut entity = commands.spawn((
             ChildOf(root),
             BspGeometry,
             Mesh3d(meshes.add(batch.mesh)),
@@ -198,6 +232,18 @@ fn load_bsp(
                 debug,
             },
         ));
+        if let Some(image) = &lightmaps.image {
+            entity.insert(Lightmap {
+                image: image.clone(),
+                // Full atlas: the per-face rects are already folded into UV_1,
+                // because this field is per-entity and a batch holds many faces.
+                uv_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                // Bicubic wants a linear sampler, which the atlas has. It is
+                // smoother across the low-resolution patches, and the light
+                // leaks it can cause are held off by the packer's extrusion.
+                bicubic_sampling: true,
+            });
+        }
     }
 
     mats.load_time = started.elapsed();
@@ -210,10 +256,10 @@ fn load_bsp(
 
 /// Resolve one texture name to a `StandardMaterial`.
 ///
-/// Unlit on purpose. Without lightmaps there is nothing to light these with but
-/// a single directional light, which reads far worse than flat albedo and hides
-/// texture problems in shadow. Flat is the honest intermediate state -- 1.4 is
-/// what makes it look like TF2.
+/// These were `unlit` through 1.2, when there was nothing to light them with.
+/// Now the lightmap supplies indirect diffuse, so they must be lit or Bevy
+/// ignores the `Lightmap` component entirely — and the failure mode is "nothing
+/// changed on screen" rather than an error, which is worth knowing about.
 fn build_material(
     vfs: &Vfs,
     name: &str,
@@ -295,6 +341,14 @@ fn build_material(
         },
         double_sided: def.no_cull,
         cull_mode: (!def.no_cull).then_some(CullFace::Back),
+        // Fully rough, non-metallic: Source's diffuse lightmap carries all the
+        // shading, so any specular response here is invention.
+        perceptual_roughness: 1.0,
+        metallic: 0.0,
+        // Source bakes at a different scale than Bevy's units; this is the knob
+        // for overall brightness and is tuned by eye against the game.
+        lightmap_exposure: lightmap_exposure(),
+        unlit: false,
         uv_transform: def.transform.as_ref().map_or(Affine2::IDENTITY, |t| {
             // `$basetexturetransform` rotates and scales about a centre, so the
             // centre has to be moved to the origin and back around it.
@@ -307,7 +361,6 @@ fn build_material(
                 )
                 * Affine2::from_translation(-center)
         }),
-        unlit: true,
         ..default()
     }
 }

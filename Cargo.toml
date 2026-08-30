@@ -21,6 +21,11 @@ vbsp = { git = "https://github.com/eira-fransham/vbsp", rev = "cd1711720be854654
 # so name it explicitly rather than let the mismatch surface as a baffling
 # "expected Vec3, found Vec3".
 glam = "0.30"
+# The lightmap packer. Declared exactly as vbsp declares it -- git URL, no rev.
+# A rev here would make it a *different source* to Cargo, so the two copies would
+# not unify and `compute_lightmap_atlas_rgb32f` would reject our packer. The
+# actual commit is pinned by Cargo.lock.
+qbsp = { git = "https://github.com/eira-fransham/qbsp.git" }
 vmt-parser = "0.2"
 vtf = "0.3"
 

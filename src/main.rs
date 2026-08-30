@@ -63,6 +63,7 @@ struct Toggles {
     /// bringing geometry up, not something to leave on.
     cull_override: Option<bool>,
     surface: Surface,
+    lightmap_exposure: f32,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -115,6 +116,7 @@ fn main() {
             } else {
                 Surface::Textured
             },
+            lightmap_exposure: bsp::lightmap_exposure(),
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -134,6 +136,7 @@ fn main() {
                 input,
                 apply_view,
                 apply_toggles,
+                apply_lightmap_exposure,
                 fix_reference_materials,
                 report,
                 headless_capture,
@@ -223,6 +226,29 @@ fn input(keys: Res<ButtonInput<KeyCode>>, mut view: ResMut<View>, mut toggles: R
     }
     if keys.just_pressed(KeyCode::KeyT) {
         toggles.surface = toggles.surface.next();
+    }
+    // Lightmap brightness has no principled value — it is the conversion between
+    // Source's light units and Bevy's, found by eye. Keep the knob to hand.
+    if keys.just_pressed(KeyCode::Minus) {
+        toggles.lightmap_exposure /= 1.5;
+    }
+    if keys.just_pressed(KeyCode::Equal) {
+        toggles.lightmap_exposure *= 1.5;
+    }
+}
+
+fn apply_lightmap_exposure(
+    toggles: Res<Toggles>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    batches: Query<&BatchMaterials>,
+) {
+    if !toggles.is_changed() {
+        return;
+    }
+    for batch in &batches {
+        if let Some(mut material) = materials.get_mut(&batch.textured) {
+            material.lightmap_exposure = toggles.lightmap_exposure;
+        }
     }
 }
 
@@ -380,6 +406,10 @@ fn report(
         toggles.surface.label(),
     ));
     out.push_str(&format!(
+        "[- =] lightmap exposure {:.1}\n",
+        toggles.lightmap_exposure
+    ));
+    out.push_str(&format!(
         "materials: {} ok, {} no texture, {} failed, {} water · {} BC + {} RGBA = {:.0} MB · {:.0} ms\n",
         m.resolved,
         m.missing_texture,
@@ -401,9 +431,23 @@ fn report(
         s.build_time.as_secs_f32() * 1000.0,
     ));
     out.push_str(&format!(
-        "{} faces drawn · {} skipped (nodraw/sky/trigger) · {} displaced\n",
-        s.faces_drawn, s.faces_skipped, s.faces_displaced,
+        "{} faces drawn · {} skipped (nodraw/sky/trigger) · {} displaced · {} lit\n",
+        s.faces_drawn, s.faces_skipped, s.faces_displaced, s.faces_lit,
     ));
+    let l = &bsp_report.lightmaps;
+    match l.error {
+        Some(e) => out.push_str(&format!("lightmaps: {e}\n")),
+        None => out.push_str(&format!(
+            "lightmap atlas {}x{} · {} styles · {} patches, {} without · {:.0} MB · {:.0} ms\n",
+            l.atlas.x,
+            l.atlas.y,
+            l.styles,
+            l.faces_with_patch,
+            l.faces_without,
+            l.bytes as f32 / (1024.0 * 1024.0),
+            l.build_time.as_secs_f32() * 1000.0,
+        )),
+    }
     out.push_str(&format!(
         "{} models used, {} orphaned · side set on {} · mismatches {} ({} strong)\n",
         s.models_used,
