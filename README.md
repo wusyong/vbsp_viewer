@@ -1,3 +1,3 @@
-# TF2 rewritten in Rust
+# TF2 in ECS
 
 ![](shot.png)

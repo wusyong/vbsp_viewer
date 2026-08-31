@@ -1912,6 +1912,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_vbsp"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "image",
+ "qbsp",
+ "tf-asset-loader",
+ "vbsp 0.9.1",
+ "vmt-parser",
+ "vtf",
+]
+
+[[package]]
 name = "bevy_window"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6332,19 +6345,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "vpk",
-]
-
-[[package]]
-name = "tf2-bevy-viewer"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "image",
- "qbsp",
- "tf-asset-loader",
- "vbsp 0.9.1",
- "vmt-parser",
- "vtf",
 ]
 
 [[package]]

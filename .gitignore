@@ -1,8 +1,8 @@
 /target
 
 # Valve's map data cannot be redistributed -- regenerate it from your own TF2
-# install (see crates/tf2-bevy-viewer/README.md). The glb is ~170 MB anyway.
-/crates/tf2-bevy-viewer/assets/maps/
+# install (see crates/bevy_vbsp/README.md). The glb is ~170 MB anyway.
+/crates/bevy_vbsp/assets/maps/
 shot.png
 
 # Upstream vbsp ships two .bsp fixtures (24 MB) used only by its bench and one

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/tf2-bevy-viewer",
+    "crates/bevy_vbsp",
 
     # Vendored -- see crates/VENDORING.md for upstream URLs, pinned revisions,
     # and the (manifest-only) changes made to each.
@@ -17,7 +17,7 @@ members = [
 # The vendored crates carry binaries of their own (qbsp's write-lightmaps), so
 # without this a bare `cargo run` at the root is ambiguous. Default to the only
 # thing anyone here actually wants to run; the rest still build as dependencies.
-default-members = ["crates/tf2-bevy-viewer"]
+default-members = ["crates/bevy_vbsp"]
 
 # Debug builds of the viewer are unusable at opt-level 0 -- a 20 MB BSP takes
 # tens of seconds to parse. Level 1 on our own code keeps compiles quick while

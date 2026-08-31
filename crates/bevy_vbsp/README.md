@@ -1,4 +1,4 @@
-# tf2-bevy-viewer
+# bevy_vbsp
 
 Phase 1 of [the roadmap](../../tf2-bevy-phase1-roadmap.md). Two ways to look at the
 same map, toggled at runtime with `G`:
