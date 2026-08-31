@@ -58,6 +58,9 @@ pub struct LightmapStats {
     pub styles: usize,
     pub faces_with_patch: usize,
     pub faces_without: usize,
+    /// Faces that had a switchable light composited onto the base bake. Zero on
+    /// every non-Halloween map.
+    pub faces_composited: usize,
     pub build_time: std::time::Duration,
     pub error: Option<&'static str>,
 }
@@ -102,17 +105,17 @@ pub fn build(bsp: &Bsp, images: &mut Assets<Image>) -> (Lightmaps, LightmapStats
         }
     }
 
-    let per_style = atlas.data.into_inner();
+    let mut per_style = atlas.data.into_inner();
     stats.styles = per_style.len();
 
-    // Style 0 is the base bake. The rest are switchable lights, which need a
-    // per-style atlas composited at runtime -- deferred, and not something the
-    // other Source viewers do either.
-    let Some(base) = per_style.get(&LightmapStyle(0)) else {
+    let Some(mut base) = per_style.remove(&LightmapStyle(0)) else {
         stats.error = Some("atlas has no style 0");
         stats.build_time = start.elapsed();
         return (Lightmaps::default(), stats);
     };
+
+    stats.faces_composited = composite_styles(bsp, &atlas.rects, &per_style, &mut base);
+    let base = &base;
 
     let size = UVec2::new(base.width(), base.height());
     // Straight reinterpretation: the buffer is already RGBA f32 in the layout
@@ -151,4 +154,66 @@ pub fn build(bsp: &Bsp, images: &mut Assets<Image>) -> (Lightmaps, LightmapStats
         },
         stats,
     )
+}
+
+/// Add the switchable lights back onto the base bake.
+///
+/// `dface_t.styles` is four slots: slot 0 is the always-on bake, and a non-255
+/// value in slots 1..3 names a switchable light that also contributes. The
+/// packer returns one atlas *per style*, all sharing a size and a packing, so
+/// the base and every extra live at the same pixel rect for a given face.
+///
+/// **Not a pixel-wise sum of the atlases.** A style atlas is created filled with
+/// `default_color`, which is white here so that unlit faces render at full
+/// albedo -- so adding whole images together would add white across every region
+/// the style does not touch and blow the map out. Instead this walks faces, and
+/// for each one only reads the styles that face actually declares. Regions a
+/// style does not cover are never sampled from it.
+///
+/// The assumption worth stating: this composites every switchable light as
+/// **on**, because a static viewer has no entity I/O to tell it otherwise. A map
+/// that ships lights "initially dark" will render brighter here than in game.
+///
+/// Returns the number of faces that got a contribution. On ctf_2fort that is
+/// zero -- the map has one style and nothing switchable -- so this is dead
+/// weight there and only earns itself on the Halloween maps, where
+/// koth_harvest_event has 4,200 of 8,831 visible faces touched by one of twelve
+/// switchable lights.
+fn composite_styles(
+    bsp: &Bsp,
+    rects: &HashMap<u32, Rect>,
+    extra: &HashMap<LightmapStyle, image::Rgba32FImage>,
+    base: &mut image::Rgba32FImage,
+) -> usize {
+    if extra.is_empty() {
+        return 0;
+    }
+    let mut composited = 0;
+    for (face_id, rect) in rects {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let Some(face) = bsp.face(*face_id as usize) else {
+            continue;
+        };
+        let mut touched = false;
+        for style in face.styles.iter().skip(1).filter(|s| **s != 255) {
+            let Some(src) = extra.get(&LightmapStyle(*style)) else {
+                continue;
+            };
+            for y in rect.y..(rect.y + rect.height).min(base.height()) {
+                for x in rect.x..(rect.x + rect.width).min(base.width()) {
+                    let add = *src.get_pixel(x, y);
+                    let dst = base.get_pixel_mut(x, y);
+                    // Alpha is not a light channel; leave it be.
+                    for c in 0..3 {
+                        dst.0[c] += add.0[c];
+                    }
+                }
+            }
+            touched = true;
+        }
+        composited += touched as usize;
+    }
+    composited
 }

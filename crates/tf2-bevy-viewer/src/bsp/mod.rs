@@ -158,10 +158,11 @@ fn load_bsp(
         warn!("no lightmaps: {e}");
     } else {
         info!(
-            "lightmap atlas {}x{}, {} styles, {:.0} MB in {:?}",
+            "lightmap atlas {}x{}, {} styles, {} faces composited, {:.0} MB in {:?}",
             lightmap_stats.atlas.x,
             lightmap_stats.atlas.y,
             lightmap_stats.styles,
+            lightmap_stats.faces_composited,
             lightmap_stats.bytes as f32 / (1024.0 * 1024.0),
             lightmap_stats.build_time,
         );

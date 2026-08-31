@@ -392,11 +392,33 @@ fn push_face(
     }
 
     let first = accum.positions.len();
-    for pos in face.vertex_positions() {
-        // UVs must be computed in Source space -- the texture vectors are a dot
-        // product against the unconverted position. Convert after.
-        accum.uvs.push(texture.uv(pos).to_array());
-        accum.positions.push(to_bevy(pos + origin).to_array());
+    // UVs must be computed in Source space -- the texture vectors are a dot
+    // product against the unconverted position. Convert after.
+    //
+    // The two arms differ only in *which* position feeds the UV. A displacement
+    // has to project from the **undisplaced** base grid, not from where the
+    // vertex ended up: Source interpolates the base face's corner UVs across the
+    // grid, and because `TextureInfo::uv` is affine and the base grid is a
+    // bilinear subdivision of those corners, projecting the base position is the
+    // same thing. Project from the displaced position instead and the texture
+    // slides down every slope -- on ctf_2fort the mean error is only 0.024 of a
+    // tile, but 7.2% of vertices exceed 0.1 and the worst is 0.77 of a tile, on
+    // chicken wire, where a three-quarter-tile shift is plainly visible.
+    match face.displacement() {
+        Some(disp) => {
+            for (offset, base) in disp.raw_vertices() {
+                accum.uvs.push(texture.uv(base).to_array());
+                accum
+                    .positions
+                    .push(to_bevy(base + offset.displacement() + origin).to_array());
+            }
+        }
+        None => {
+            for pos in face.vertex_positions() {
+                accum.uvs.push(texture.uv(pos).to_array());
+                accum.positions.push(to_bevy(pos + origin).to_array());
+            }
+        }
     }
     // `lightmap_uvs` runs 0..1 across this face's own patch; scale into the
     // patch's slot in the atlas. A face with no patch is parked at the atlas
