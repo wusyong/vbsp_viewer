@@ -3,6 +3,17 @@ name = "bevy_vbsp"
 version = "0.1.0"
 edition = "2024"
 
+# A library, with the viewer that was used to build it kept beside it. Both
+# targets can carry the crate's name -- cargo keys them by kind -- which keeps a
+# bare `cargo run` working without a `--bin` flag.
+[lib]
+name = "bevy_vbsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy_vbsp"
+path = "src/main.rs"
+
 [dependencies]
 bevy = { version = "0.19.1", features = ["dynamic_linking"] }
 image = "0.25"

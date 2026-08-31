@@ -10,12 +10,6 @@
 //! up instantly as a difference from the reference, which is far easier than
 //! deciding in the abstract whether a wall is in the right place.
 
-mod bsp;
-mod sky;
-mod vfs;
-mod vmt;
-mod vtf;
-
 use std::f32::consts::FRAC_PI_2;
 
 use bevy::{
@@ -28,7 +22,10 @@ use bevy::{
     window::{PresentMode, WindowResolution},
 };
 
-use bsp::{BatchMaterials, BspGeometry, BspPlugin, BspReport, HAMMER_UNIT};
+// Everything that reads a map is the library beside this file; `bsp` stays in
+// scope by name because the viewer reaches for a few things that are not worth
+// re-exporting at the crate root.
+use bevy_vbsp::bsp::{self, BatchMaterials, BspGeometry, BspPlugin, BspReport, HAMMER_UNIT};
 
 const MAP_GLB: &str = "maps/ctf_2fort.glb";
 
