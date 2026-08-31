@@ -11,6 +11,7 @@
 //! deciding in the abstract whether a wall is in the right place.
 
 mod bsp;
+mod sky;
 mod vfs;
 mod vmt;
 mod vtf;
@@ -452,6 +453,18 @@ fn report(
             l.bytes as f32 / (1024.0 * 1024.0),
             l.build_time.as_secs_f32() * 1000.0,
         )),
+    }
+    match &bsp_report.sky {
+        Some(sky) => out.push_str(&format!(
+            "sky {} · {}×{} cube from {} textures · {:.1} MB · {:.0} ms\n",
+            sky.name,
+            sky.size,
+            sky.size,
+            sky.textures,
+            sky.bytes as f32 / 1e6,
+            sky.load_time.as_secs_f32() * 1000.0,
+        )),
+        None => out.push_str("sky: none\n"),
     }
     out.push_str(&format!(
         "{} models used, {} orphaned · side set on {} · mismatches {} ({} strong)\n",

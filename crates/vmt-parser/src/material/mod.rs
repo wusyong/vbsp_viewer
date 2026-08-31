@@ -129,6 +129,22 @@ impl Material {
             Material::Sprite(mat) => Some(&mat.base_texture),
             Material::Water(mat) => mat.base_texture.as_deref(),
             Material::EyeRefract(mat) => Some(&mat.iris),
+            // ---- LOCAL ADDITION, not upstream ----------------------------
+            // Six shaders modelled with a `$basetexture` field were falling
+            // through the `_ => None` below, so the accessor reported "no
+            // base texture" for materials that plainly have one -- a silent
+            // wrong answer that reads like a missing asset. Found via `sky`,
+            // where every face of a skybox resolved to nothing.
+            //
+            // This belongs here rather than in a caller: leaving it out means
+            // every call site has to know which variants the accessor lies
+            // about, and the next one along will not.
+            Material::Sky(mat) => Some(&mat.base_texture),
+            Material::Cable(mat) => Some(&mat.base_texture),
+            Material::Modulate(mat) | Material::DecalModulate(mat) => Some(&mat.base_texture),
+            Material::SpriteCard(mat) => mat.base_texture.as_deref(),
+            Material::Refract(mat) => mat.base_texture.as_deref(),
+            // ---- end local addition ---------------------------------------
             _ => None,
         }
     }
@@ -140,6 +156,13 @@ impl Material {
             Material::VertexLitGenericDx6(mat) => Some(&mat.base_texture_transform),
             Material::UnlitTwoTexture(mat) => Some(&mat.base_texture_transform),
             Material::WorldVertexTransition(mat) => Some(&mat.base_texture_transform),
+            // ---- LOCAL ADDITION, not upstream ----------------------------
+            // Same hole, but `sky` is the only omitted variant that carries the
+            // field at all. Not cosmetic: sky sides are 2:1 with `scale 1 2`,
+            // so without the transform the gradient tiles instead of clamping
+            // to the horizon.
+            Material::Sky(mat) => Some(&mat.base_texture_transform),
+            // ---- end local addition ---------------------------------------
             _ => None,
         }
     }

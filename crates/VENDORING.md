@@ -9,8 +9,10 @@
 
 ## Local changes
 
-Manifest-only, **except `vtf`** — see the last entry. Everywhere else no `.rs`
-file has been touched, so a diff against upstream stays readable.
+`vbsp` and `qbsp` are manifest-only — no `.rs` file touched, so a diff against
+upstream stays readable. `vtf` and `vmt-parser` each carry one source change,
+both fenced by a `LOCAL ADDITION` comment block naming what it is and why
+upstream cannot supply it. Grep for that phrase to find every divergence.
 
 * **`vbsp`, `vbsp/common`, `qbsp`** — `glam` 0.30 → **0.32**, and qbsp's
   optional `bevy_reflect` 0.18 → **0.19**, to match bevy 0.19. This is the
@@ -29,7 +31,7 @@ file has been touched, so a diff against upstream stays readable.
 * **`qbsp`** — upstream is its own workspace root; dropped `[workspace]` and
   `[workspace.package]` and inlined the six inherited fields here and in
   `qbsp_macros/` and `tools/write-lightmaps/`.
-* **`vtf`** — **the one source change.** Added `get_mip`, `mip_count` and
+* **`vtf`** — **source change.** Added `get_mip`, `mip_count` and
   `mip_size` to `VTFImage` in `src/image.rs`, inside a `LOCAL ADDITION` comment
   fence. Upstream exposes mip 0 and nothing else: `get_offset` takes a mip index
   but lives in a private `mod utils`, and `VTFImage`'s `bytes`/`offset` fields
@@ -42,9 +44,30 @@ file has been touched, so a diff against upstream stays readable.
   mip to find it. wgpu wants the opposite order, so the caller walks
   `0..mip_count` and the reversal happens on the way out.
 
-`vmt-parser` is unmodified. Its GitHub mirror is stale at 0.2.0 (with the wrong
-repo URL in its own manifest) — Codeberg is the real home, and the revision
-above is byte-identical to the crates.io 0.2.1 tarball's `src/`.
+* **`vmt-parser`** — **source change.** Six match arms added to
+  `Material::base_texture()` and one to `base_texture_transform()` in
+  `src/material/mod.rs`, in a `LOCAL ADDITION` fence. `sky`, `spritecard`,
+  `cable`, `refract`, `modulate` and `decalmodulate` are all modelled *with* a
+  `$basetexture` field and all fell through the accessor's `_ => None`, so it
+  reported "no base texture" for materials that plainly have one.
+
+  Unlike `vtf`, this one was reachable from outside — the variants and their
+  fields are public, so a helper in the viewer would have worked. It went here
+  anyway, and the reason is worth keeping: a helper is a *second* dispatch to
+  keep in step with theirs, and it leaves `base_texture()` still returning the
+  wrong answer for whoever calls it next. The fix belongs where the bug is.
+  Adding arms to an existing match is also about the most merge-friendly edit
+  there is — if upstream ever fixes it, the diff simply disappears.
+
+  This is the patch to send upstream verbatim.
+
+Both of the above are candidates for upstreaming. Note the payoff is deferred
+either way: we pin revisions, so an accepted patch only reaches us when we
+choose to bump.
+
+`vmt-parser`'s GitHub mirror is stale at 0.2.0 (with the wrong repo URL in its
+own manifest) — Codeberg is the real home, and the revision above is
+byte-identical to the crates.io 0.2.1 tarball's `src/`.
 
 ## The .bsp fixtures
 

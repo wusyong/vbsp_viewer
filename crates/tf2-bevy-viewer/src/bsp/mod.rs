@@ -13,11 +13,13 @@ pub mod lightmap;
 use std::path::PathBuf;
 
 use bevy::math::Affine2;
+use bevy::core_pipeline::Skybox;
 use bevy::pbr::Lightmap;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Face as CullFace, WgpuFeatures};
 use bevy::render::renderer::RenderDevice;
 
+use crate::sky::{self, SkyReport};
 use crate::vfs::Vfs;
 
 pub use geometry::{HAMMER_UNIT, REFERENCE_YAW, Stats};
@@ -84,6 +86,8 @@ pub struct BspReport {
     pub stats: Stats,
     pub materials: MaterialStats,
     pub lightmaps: LightmapStats,
+    /// `None` when the map names no sky, or the sky failed to load.
+    pub sky: Option<SkyReport>,
     /// Texture names that did not resolve, for the HUD. Capped — with a broken
     /// search path this would otherwise be every material in the map.
     pub missing: Vec<String>,
@@ -101,7 +105,8 @@ pub struct BspPlugin;
 impl Plugin for BspPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BspReport>()
-            .add_systems(Startup, load_bsp);
+            .add_systems(Startup, load_bsp)
+            .add_systems(Update, attach_sky);
     }
 }
 
@@ -252,6 +257,62 @@ fn load_bsp(
         mats.resolved, mats.missing_texture, mats.failed, mats.load_time
     );
     report.materials = mats;
+
+    // The sky is built here rather than in the camera's setup because this is
+    // where the VFS and the parsed map both are. Attaching it to the camera is a
+    // separate system, since Startup ordering between plugins is not something
+    // to rely on.
+    let started = std::time::Instant::now();
+    match sky::name(&bsp) {
+        None => info!("map has no skyname"),
+        Some(name) => match sky::load(&vfs, &name) {
+            Ok((image, mut sky_report)) => {
+                sky_report.load_time = started.elapsed();
+                info!(
+                    "sky {} {}x{} from {} textures, {:.1} MB in {:?}",
+                    sky_report.name,
+                    sky_report.size,
+                    sky_report.size,
+                    sky_report.textures,
+                    sky_report.bytes as f32 / 1e6,
+                    sky_report.load_time,
+                );
+                commands.insert_resource(SkyImage(images.add(image)));
+                report.sky = Some(sky_report);
+            }
+            Err(e) => warn!("no sky: {e}"),
+        },
+    }
+}
+
+/// The cubemap, waiting for a camera to hang it on.
+#[derive(Resource)]
+struct SkyImage(Handle<Image>);
+
+/// Attach the sky to any camera that does not have one yet.
+///
+/// Runs every frame rather than once at startup: the camera and the map load in
+/// two different plugins' `Startup` systems, and ordering across plugins is a
+/// thing you get to be wrong about exactly once. The query filters to cameras
+/// without a `Skybox`, so it does nothing after the first frame.
+fn attach_sky(
+    mut commands: Commands,
+    sky: Option<Res<SkyImage>>,
+    cameras: Query<Entity, (With<Camera3d>, Without<Skybox>)>,
+) {
+    let Some(sky) = sky else { return };
+    for camera in &cameras {
+        commands.entity(camera).insert(Skybox {
+            image: Some(sky.0.clone()),
+            // Not a 0..1 multiplier: the shader does `colour * brightness` and
+            // the extract stage folds in the camera's exposure first, so this is
+            // a physical light level. 1.0 renders black. Reusing the same
+            // constant the scene's `DirectionalLight` is set to keeps the sky and
+            // the sun on one scale rather than two numbers tuned separately.
+            brightness: light_consts::lux::OVERCAST_DAY,
+            ..default()
+        });
+    }
 }
 
 /// Resolve one texture name to a `StandardMaterial`.
