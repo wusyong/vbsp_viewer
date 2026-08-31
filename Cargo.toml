@@ -11,6 +11,7 @@ members = [
     "crates/qbsp/qbsp_macros",
     "crates/qbsp/tools/write-lightmaps",
     "crates/vmt-parser",
+    "crates/vtf",
 ]
 
 # The vendored crates carry binaries of their own (qbsp's write-lightmaps), so

@@ -5,11 +5,12 @@
 | `vbsp` | https://github.com/eira-fransham/vbsp | `cd1711720be854654be7708fec44b2b11fc08424` |
 | `qbsp` | https://github.com/eira-fransham/qbsp.git | `ca4e05b4ece63cba883615144e31286c01222672` |
 | `vmt-parser` | https://codeberg.org/icewind/vmt-parser | `bf47f537940c26d9571fc2f8761d1e9edbbc7acc` |
+| `vtf` | https://github.com/roman901/vtf-rs | `4f8a4fec41b4d2b3c6b51933370c8cebfb4bba2f` (0.4.1) |
 
 ## Local changes
 
-Manifests only — no `.rs` file has been touched, so a diff against upstream
-stays readable.
+Manifest-only, **except `vtf`** — see the last entry. Everywhere else no `.rs`
+file has been touched, so a diff against upstream stays readable.
 
 * **`vbsp`, `vbsp/common`, `qbsp`** — `glam` 0.30 → **0.32**, and qbsp's
   optional `bevy_reflect` 0.18 → **0.19**, to match bevy 0.19. This is the
@@ -28,6 +29,18 @@ stays readable.
 * **`qbsp`** — upstream is its own workspace root; dropped `[workspace]` and
   `[workspace.package]` and inlined the six inherited fields here and in
   `qbsp_macros/` and `tools/write-lightmaps/`.
+* **`vtf`** — **the one source change.** Added `get_mip`, `mip_count` and
+  `mip_size` to `VTFImage` in `src/image.rs`, inside a `LOCAL ADDITION` comment
+  fence. Upstream exposes mip 0 and nothing else: `get_offset` takes a mip index
+  but lives in a private `mod utils`, and `VTFImage`'s `bytes`/`offset` fields
+  are private too, so the chain is unreachable from outside the crate. 0.4.1
+  does not help — its only changes are on the writer side. Without this,
+  everything renders unmipped and shimmers at distance (milestone 1.5b).
+
+  Worth knowing when reading that code: **VTF stores mips smallest-first**, so
+  mip 0 sits last in the file and `get_offset` sums the sizes of every *smaller*
+  mip to find it. wgpu wants the opposite order, so the caller walks
+  `0..mip_count` and the reversal happens on the way out.
 
 `vmt-parser` is unmodified. Its GitHub mirror is stale at 0.2.0 (with the wrong
 repo URL in its own manifest) — Codeberg is the real home, and the revision

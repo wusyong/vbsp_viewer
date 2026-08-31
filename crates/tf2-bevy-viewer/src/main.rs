@@ -431,8 +431,13 @@ fn report(
         s.build_time.as_secs_f32() * 1000.0,
     ));
     out.push_str(&format!(
-        "{} faces drawn · {} skipped (nodraw/sky/trigger) · {} displaced · {} lit\n",
-        s.faces_drawn, s.faces_skipped, s.faces_displaced, s.faces_lit,
+        "{} faces drawn · {} skipped ({} by flag, {} by tools/ name) · {} displaced · {} lit\n",
+        s.faces_drawn,
+        s.faces_skipped,
+        s.faces_skipped - s.faces_tool,
+        s.faces_tool,
+        s.faces_displaced,
+        s.faces_lit,
     ));
     let l = &bsp_report.lightmaps;
     match l.error {

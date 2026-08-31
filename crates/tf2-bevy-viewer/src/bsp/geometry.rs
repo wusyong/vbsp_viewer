@@ -50,6 +50,25 @@ fn dir_to_bevy(v: Vec3) -> Vec3 {
     Vec3::new(v.y, v.z, v.x)
 }
 
+/// Editor-only surfaces that carry no reject flag of their own.
+///
+/// `is_visible()` handles the flagged ones -- NODRAW, SKIP, HINT, TRIGGER, SKY,
+/// SKY2D -- which on ctf_2fort is 912 faces, mostly `toolsskybox` (454) and
+/// `toolstrigger` (452). But the flags live on the *texture*, and a few tool
+/// materials are compiled without them: `tools/toolsblack` renders as 92 faces
+/// of opaque black, which is why the map has black slabs floating in it. Every
+/// tool material lives under `tools/`, so the prefix is the whole rule.
+///
+/// Deliberately not a flag check: this is a naming convention, and treating it
+/// as one keeps it obvious that it is a heuristic rather than something the
+/// format guarantees.
+fn is_tool_texture(name: &str) -> bool {
+    // Byte-wise, not `name[..6]`: slicing a `&str` by index panics on a char
+    // boundary, and nothing guarantees a texture name is ASCII.
+    let name = name.trim_start_matches(['/', '\\']).as_bytes();
+    name.len() >= 6 && name[..6].eq_ignore_ascii_case(b"tools/")
+}
+
 /// A brush model and where it belongs. Model 0 is worldspawn; 1..n are owned by
 /// brush entities.
 pub struct BrushModel {
@@ -117,8 +136,12 @@ pub struct Stats {
     /// necessarily a bug, but it is worth watching.
     pub models_orphaned: usize,
     pub faces_drawn: usize,
-    /// Faces rejected by `is_visible()`: NODRAW, SKIP, HINT, TRIGGER and SKY.
+    /// Faces rejected by `is_visible()`: NODRAW, SKIP, HINT, TRIGGER and SKY,
+    /// plus the unflagged `tools/` materials counted separately below.
     pub faces_skipped: usize,
+    /// Of those, the ones dropped by name rather than by flag. See
+    /// `is_tool_texture`.
+    pub faces_tool: usize,
     pub faces_displaced: usize,
     /// Faces that got a real lightmap patch. The rest sample the atlas's neutral
     /// texel and render unlit.
@@ -178,6 +201,11 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
                 continue;
             }
             let texture = face.texture();
+            if is_tool_texture(texture.name()) {
+                stats.faces_skipped += 1;
+                stats.faces_tool += 1;
+                continue;
+            }
             let accum = accums
                 .entry(texture.texture_data_index)
                 .or_insert_with(|| Accum {

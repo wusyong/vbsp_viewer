@@ -23,4 +23,4 @@ vbsp = { path = "../vbsp" }
 # makes them *different sources* to Cargo, and the types would not unify.)
 qbsp = { path = "../qbsp" }
 vmt-parser = { path = "../vmt-parser" }
-vtf = "0.3"
+vtf = { path = "../vtf" }
