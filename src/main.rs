@@ -15,7 +15,7 @@ use bevy::pbr::wireframe::{WireframeConfig, WireframePlugin};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
-use bevy_bsp::{MapGeometry, MapInfo, SurfaceInfo};
+use bevy_bsp::{DisplacementGeometry, MapGeometry, MapInfo, SurfaceInfo};
 use bsp::geometry::ModelGeometry;
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -224,6 +224,34 @@ struct FlyCamera {
 #[derive(Component)]
 struct HudText;
 
+/// Visibility of brush geometry and of terrain, as two provably disjoint
+/// queries.
+///
+/// Each filter excludes the *other* marker as well as the HUD. Without that,
+/// Bevy cannot prove two `&mut Visibility` queries do not overlap — an entity
+/// could in principle carry both markers — and panics with B0001.
+type BrushVisibility<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Visibility,
+    (
+        With<MapGeometry>,
+        Without<DisplacementGeometry>,
+        Without<HudText>,
+    ),
+>;
+
+type TerrainVisibility<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Visibility,
+    (
+        With<DisplacementGeometry>,
+        Without<MapGeometry>,
+        Without<HudText>,
+    ),
+>;
+
 fn setup_scene(mut commands: Commands, args: Res<Args>) {
     commands.spawn((
         Camera3d::default(),
@@ -324,6 +352,14 @@ fn load_map(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let displacements = match bsp::displacement::build_displacements(&bsp) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("failed to tessellate displacements: {e}");
+            return;
+        }
+    };
+
     let draw_calls = bevy_bsp::spawn_model(
         &mut commands,
         &mut meshes,
@@ -333,7 +369,14 @@ fn load_map(
         [0.0; 3],
         "worldspawn",
     );
-    *info = bevy_bsp::map_info(&map_name, bsp.version(), &world);
+    let disp_draw_calls = bevy_bsp::spawn_displacements(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &displacements,
+        &names,
+    );
+    *info = bevy_bsp::map_info(&map_name, bsp.version(), &world, &displacements);
 
     let start = default_viewpoint(&world);
     if let Ok((mut transform, mut fly)) = camera.single_mut() {
@@ -346,10 +389,13 @@ fn load_map(
     }
 
     info!(
-        "{map_name}: {} materials, {} verts, {} tris, {draw_calls} draw calls in {:.0} ms",
+        "{map_name}: {} materials, {} verts, {} tris ({draw_calls} draw calls); \n         {} disps, {} verts, {} tris ({disp_draw_calls} draw calls); {:.0} ms",
         info.materials,
         info.vertices,
         info.triangles,
+        info.displacements_built,
+        info.displacement_vertices,
+        info.displacement_triangles,
         started.elapsed().as_secs_f32() * 1000.0,
     );
 }
@@ -521,8 +567,16 @@ fn toggle_debug_views(
     keys: Res<ButtonInput<KeyCode>>,
     mut wireframe: ResMut<WireframeConfig>,
     mut hud: Query<&mut Visibility, With<HudText>>,
-    mut geometry: Query<&mut Visibility, (With<MapGeometry>, Without<HudText>)>,
+    mut geometry: BrushVisibility,
+    mut terrain: TerrainVisibility,
 ) {
+    fn toggled(current: Visibility) -> Visibility {
+        match current {
+            Visibility::Hidden => Visibility::Inherited,
+            _ => Visibility::Hidden,
+        }
+    }
+
     if keys.just_pressed(KeyCode::F1) {
         for mut visibility in &mut hud {
             *visibility = match *visibility {
@@ -534,14 +588,16 @@ fn toggle_debug_views(
     if keys.just_pressed(KeyCode::F2) {
         wireframe.global = !wireframe.global;
     }
+    // Isolating brush geometry from terrain is the fastest way to tell which
+    // builder is at fault when something looks wrong.
     if keys.just_pressed(KeyCode::F3) {
-        // Isolating brush geometry from displacements is the fastest way to
-        // tell which builder is at fault when something looks wrong (M4).
         for mut visibility in &mut geometry {
-            *visibility = match *visibility {
-                Visibility::Hidden => Visibility::Inherited,
-                _ => Visibility::Hidden,
-            };
+            *visibility = toggled(*visibility);
+        }
+    }
+    if keys.just_pressed(KeyCode::F4) {
+        for mut visibility in &mut terrain {
+            *visibility = toggled(*visibility);
         }
     }
 }
@@ -596,18 +652,22 @@ fn update_hud(
     *text = Text::new(format!(
         "{} (bsp v{})\n\
          {} materials  {} verts  {} tris  {} draw calls\n\
-         faces {}/{}  ({} displacement, deferred to M4)\n\
+         terrain {} disps  {} verts  {} tris\n\
+         faces {}/{}  ({} on displacements)\n\
          pos {x:.0} {y:.0} {z:.0} (Source units)\n\
          {:.1} ms/frame  ({:.0} fps{}){}\n\
          \n\
          WASD/QE move, Shift sprint, click to look, Esc release\n\
-         F1 overlay  F2 wireframe  F3 hide brushes",
+         F1 overlay  F2 wireframe  F3 brushes  F4 terrain",
         info.name,
         info.bsp_version,
         info.materials,
         info.vertices,
         info.triangles,
         draw_calls,
+        info.displacements_built,
+        info.displacement_vertices,
+        info.displacement_triangles,
         info.faces_built,
         info.faces_total,
         info.displacement_faces,

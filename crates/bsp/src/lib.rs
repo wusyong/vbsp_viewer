@@ -15,6 +15,7 @@
 //! # Ok::<(), bsp::BspError>(())
 //! ```
 
+pub mod displacement;
 pub mod flags;
 pub mod geometry;
 pub mod lump;

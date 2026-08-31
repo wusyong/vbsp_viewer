@@ -223,6 +223,38 @@ Most TF2 maps put all ground and cliffs in displacements; Badlands has 1191 of t
 
 **Verify:** Badlands terrain is watertight, no gaps at displacement seams, silhouettes match a TF2 screenshot from the same position.
 
+### M4 findings
+
+Terrain in. `cp_badlands`: 1191/1191 displacements, 42 415 verts, 60 384 tris in **17 draw calls** — matching the DISP_VERTS and DISP_TRIS lump counts exactly, which is the cheapest correctness check available. `ctf_2fort`: 232 disps, 21 248 tris in 14.
+
+**The plan's diagonal rule was close but stated wrongly.** `CCoreDispInfo::GenerateCollisionSurface` tests the parity of the **flat** index `ndx = row * width + col`, not of `row + col`:
+
+```c
+bool bOdd = ( ( ndx % 2 ) == 1 );
+if ( bOdd ) BuildTriTLtoBR( ndx ); else BuildTriBLtoTR( ndx );
+```
+
+The two agree only because `width = 2^power + 1` is always odd. Valve's form is transcribed verbatim, with a test proving the equivalence for every legal width.
+
+**Interpolation is not a plain `(u, v)` bilerp.** `i` walks corner0→corner1 along one edge and corner3→corner2 along the other, then `j` crosses between those two points; the flat index is `i * side + j`. A test pins the four grid corners to the four parent corners, which is what catches a transposed or mis-paired lerp.
+
+**⚠️ The big find: `dface_t.side` must not be used to flip normals, and BSP face windings are clockwise.** This was a latent M2 bug, invisible because `cull_mode: None` was masking it.
+
+- `utils/vbsp/writebsp.cpp:465` writes `df->planenum = f->planenum` and `df->side = f->planenum & 1`. Source stores planes in **negated pairs**, so `planenum` already names the correctly-oriented plane and `side` is parity bookkeeping. Flipping on it inverts every odd-numbered plane — 297 of Badlands' 1191 displacement parents.
+- A face's edge ring runs **clockwise seen from the front**. Verified two ways: the ring-winding normal disagrees with the plane normal on 1191/1191 parents, and concretely, a Badlands floor whose plane is exactly `+Z` has a ring going `+Y, +X, −Y, −X` — up, right, down, left. wgpu treats counter-clockwise as front-facing, so emitting ring order directly makes every surface a backface.
+
+Both are now fixed and **backface culling is deliberately left ON** — it is the only cheap check that winding and normals agree with the BSP, and with it off, inverted geometry looks perfectly fine.
+
+The mixed-winding count was the tell: an all-or-nothing invariant (a cyclic corner rotation cannot change orientation) came back 894/1191.
+
+**Then the tripwire itself turned out to be unsound and was removed.** Comparing a *displaced* surface's accumulated normal against its *flat* parent plane is not a valid invariant. On `ctf_crasher`, most disagreements have an agreement term rounding to `-0.0` with ratio `0.0000` — pure floating-point cancellation on symmetric or folded surfaces — while two are genuinely negative (ratio 1.78) because the displacement really does fold back past its base. Kept as a *fixup* it would have inverted correct geometry on 9 of 233 maps. Winding is correct by construction instead: corner rotation, diagonal parity, and one explicit reversal, each pinned by a unit test.
+
+**Acceptance gate passed:** all **233 maps, 0 failures** — **158 585 displacements** built, 22.9 M verts / 18.3 M tris total, 0 triangles tagged REMOVE across the whole game. Heaviest map is `koth_slasher` (250 755 tris).
+
+- Vertex alpha (the `$basetexture2` blend weight) rides `ATTRIBUTE_COLOR` for M8.
+- Terrain gets smooth normals from accumulated triangle normals; flat-shaded terrain looks like crumpled paper.
+- Two `&mut Visibility` queries need mutual `Without` for the other's marker, or Bevy panics with B0001 — it cannot otherwise prove them disjoint.
+
 ### M5 — Baked lightmaps
 
 - Source lump: `LUMP_LIGHTING` (8) for LDR. `LUMP_LIGHTING_HDR` (53) also present — start with LDR, keep the lump id a parameter.

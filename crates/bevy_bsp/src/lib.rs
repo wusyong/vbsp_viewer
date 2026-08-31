@@ -13,6 +13,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bsp::displacement::DispGeometry;
 use bsp::geometry::{ModelGeometry, Surface};
 
 /// Metres per Source unit.
@@ -56,6 +57,11 @@ pub fn bevy_to_src(v: Vec3) -> [f32; 3] {
 #[derive(Component)]
 pub struct MapGeometry;
 
+/// Marker for tessellated displacement (terrain) entities, so the viewer can
+/// show brush geometry and terrain independently while debugging.
+#[derive(Component)]
+pub struct DisplacementGeometry;
+
 /// Which BSP surface an entity was built from, for the HUD and for picking.
 #[derive(Component, Clone, Debug)]
 pub struct SurfaceInfo {
@@ -81,8 +87,11 @@ pub struct MapInfo {
     /// Faces that produced geometry, and the total considered.
     pub faces_built: usize,
     pub faces_total: usize,
-    /// Faces deferred to the displacement tessellator (M4).
+    /// Faces handled by the displacement tessellator rather than as brushes.
     pub displacement_faces: usize,
+    pub displacements_built: usize,
+    pub displacement_vertices: usize,
+    pub displacement_triangles: usize,
     /// Model bounds in Source units.
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
@@ -99,12 +108,17 @@ pub fn surface_to_mesh(surface: &Surface) -> Mesh {
     let mut normals = Vec::with_capacity(count);
     let mut uvs = Vec::with_capacity(count);
     let mut lightmap_uvs = Vec::with_capacity(count);
+    let mut colors = Vec::with_capacity(count);
 
     for v in &surface.vertices {
         positions.push(src_to_bevy(v.position).to_array());
         normals.push(src_to_bevy_dir(v.normal).to_array());
         uvs.push(v.uv);
         lightmap_uvs.push(v.lightmap_uv);
+        // Displacement blend weight. Brush faces leave this at 0, so a plain
+        // grey keeps them unchanged while terrain blend zones show a gradient.
+        let shade = 1.0 - v.alpha * 0.45;
+        colors.push([shade, shade, shade, 1.0]);
     }
 
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
@@ -112,6 +126,7 @@ pub fn surface_to_mesh(surface: &Surface) -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, lightmap_uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
         .with_inserted_indices(Indices::U32(surface.indices.clone()))
 }
 
@@ -163,10 +178,9 @@ pub fn spawn_model(
         let material = materials.add(StandardMaterial {
             base_color: debug_material_color(name),
             perceptual_roughness: 0.9,
-            // Source geometry is single-sided but tool-adjacent brushes and
-            // alpha-tested grates read better without backface culling while
-            // the viewer has no material data to consult.
-            cull_mode: None,
+            // Backface culling stays ON deliberately: it is the only cheap
+            // check that winding and normals actually agree with the BSP. With
+            // it disabled, inverted geometry looks perfectly fine.
             ..default()
         });
 
@@ -189,8 +203,55 @@ pub fn spawn_model(
     geometry.surfaces.len()
 }
 
-/// Build [`MapInfo`] from a model's build stats.
-pub fn map_info(name: &str, bsp_version: i32, geometry: &ModelGeometry) -> MapInfo {
+/// Spawn tessellated terrain, one entity per material.
+///
+/// Vertex alpha is written to `ATTRIBUTE_COLOR` so the `WorldVertexTransition`
+/// blend in M8 can read it; until then it is visible as a subtle tint, which
+/// makes blend zones legible rather than invisible.
+pub fn spawn_displacements(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    geometry: &DispGeometry,
+    material_names: &[&str],
+) -> usize {
+    for surface in &geometry.surfaces {
+        let name = usize::try_from(surface.texdata)
+            .ok()
+            .and_then(|i| material_names.get(i).copied())
+            .unwrap_or("<unknown>");
+
+        let material = materials.add(StandardMaterial {
+            base_color: debug_material_color(name),
+            perceptual_roughness: 0.95,
+            ..default()
+        });
+
+        commands.spawn((
+            Mesh3d(meshes.add(surface_to_mesh(surface))),
+            MeshMaterial3d(material),
+            Transform::IDENTITY,
+            DisplacementGeometry,
+            SurfaceInfo {
+                model: 0,
+                texdata: surface.texdata,
+                material: name.to_string(),
+                flags: surface.flags,
+                triangles: surface.triangle_count(),
+            },
+            Name::new(format!("displacement:{name}")),
+        ));
+    }
+    geometry.surfaces.len()
+}
+
+/// Build [`MapInfo`] from a model's build stats and the terrain build.
+pub fn map_info(
+    name: &str,
+    bsp_version: i32,
+    geometry: &ModelGeometry,
+    displacements: &DispGeometry,
+) -> MapInfo {
     MapInfo {
         name: name.to_string(),
         bsp_version,
@@ -200,6 +261,9 @@ pub fn map_info(name: &str, bsp_version: i32, geometry: &ModelGeometry) -> MapIn
         faces_built: geometry.stats.faces_built,
         faces_total: geometry.stats.faces_total,
         displacement_faces: geometry.stats.skipped.displacement,
+        displacements_built: displacements.stats.built,
+        displacement_vertices: displacements.vertex_count(),
+        displacement_triangles: displacements.triangle_count(),
         mins: geometry.mins,
         maxs: geometry.maxs,
     }

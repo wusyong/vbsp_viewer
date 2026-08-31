@@ -20,7 +20,7 @@
 //! displacement tessellator builds those separately.
 
 use crate::flags;
-use crate::raw::{self, DFace, DTexData, TexInfo};
+use crate::raw::{DFace, DTexData, TexInfo};
 use crate::{Bsp, BspError, LumpId, Result};
 use std::collections::HashMap;
 
@@ -132,6 +132,41 @@ impl BuildStats {
     }
 }
 
+/// Groups geometry by material, keeping first-seen order rather than hash
+/// order so output is deterministic across runs.
+pub(crate) struct SurfaceSet {
+    by_texdata: HashMap<i32, usize>,
+    surfaces: Vec<Surface>,
+}
+
+impl SurfaceSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_texdata: HashMap::new(),
+            surfaces: Vec::new(),
+        }
+    }
+
+    /// The surface accumulating this material, creating it on first use.
+    pub(crate) fn surface_for(&mut self, texdata: i32, flags: i32) -> &mut Surface {
+        let slot = *self.by_texdata.entry(texdata).or_insert_with(|| {
+            self.surfaces.push(Surface {
+                texdata,
+                flags,
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                chunks: Vec::new(),
+            });
+            self.surfaces.len() - 1
+        });
+        &mut self.surfaces[slot]
+    }
+
+    pub(crate) fn into_surfaces(self) -> Vec<Surface> {
+        self.surfaces
+    }
+}
+
 /// Built geometry for one BSP model.
 #[derive(Clone, Debug)]
 pub struct ModelGeometry {
@@ -194,10 +229,7 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
         ..Default::default()
     };
 
-    // texdata index -> position in `surfaces`, so grouping stays first-seen
-    // order rather than hash order.
-    let mut by_texdata: HashMap<i32, usize> = HashMap::new();
-    let mut surfaces: Vec<Surface> = Vec::new();
+    let mut surfaces = SurfaceSet::new();
     let mut ring: Vec<[f32; 3]> = Vec::with_capacity(16);
 
     for (face_index, face) in faces[first..end].iter().enumerate() {
@@ -259,9 +291,13 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
             continue;
         }
 
-        // Plane normal, flipped when the face looks the other way down it.
+        // `planes[planenum]` is already the correctly-oriented plane: vbsp
+        // stores planes in negated pairs and writes the face's own index, so
+        // `df->side = f->planenum & 1` is parity bookkeeping, not an
+        // instruction to flip (`utils/vbsp/writebsp.cpp:465`). Flipping on
+        // `side` inverts the odd-numbered planes — 297 of Badlands' 1191
+        // displacement parents alone.
         let normal = match planes.get(face.planenum as usize) {
-            Some(plane) if face.side != 0 => negate(plane.normal),
             Some(plane) => plane.normal,
             None => {
                 stats.skipped.bad_index += 1;
@@ -269,17 +305,7 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
             }
         };
 
-        let slot = *by_texdata.entry(texinfo.texdata).or_insert_with(|| {
-            surfaces.push(Surface {
-                texdata: texinfo.texdata,
-                flags: texinfo.flags,
-                vertices: Vec::new(),
-                indices: Vec::new(),
-                chunks: Vec::new(),
-            });
-            surfaces.len() - 1
-        });
-        let surface = &mut surfaces[slot];
+        let surface = surfaces.surface_for(texinfo.texdata, texinfo.flags);
 
         let base = surface.vertices.len() as u32;
         for &position in &ring {
@@ -299,7 +325,12 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
         // the apex.
         //
         for i in 1..ring.len() as u32 - 1 {
-            let tri = [base, base + i, base + i + 1];
+            // Reversed: a BSP face's edge ring runs *clockwise* seen from the
+            // front, verified against a Badlands floor whose plane is exactly
+            // +Z and whose ring goes +Y, +X, -Y, -X. wgpu treats
+            // counter-clockwise as front-facing, so emitting the ring order
+            // directly would make every surface a backface.
+            let tri = [base, base + i + 1, base + i];
             if is_degenerate(&ring, i as usize) {
                 stats.degenerate_triangles += 1;
                 continue;
@@ -316,6 +347,7 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
         stats.faces_built += 1;
     }
 
+    let surfaces = surfaces.into_surfaces();
     stats.vertices = surfaces.iter().map(|s| s.vertices.len()).sum();
     stats.triangles = surfaces.iter().map(Surface::triangle_count).sum();
 
@@ -334,7 +366,7 @@ pub fn build_model(bsp: &Bsp, model_index: usize) -> Result<ModelGeometry> {
 /// `textureVecsTexelsPerWorldUnits` is a pair of affine planes giving texel
 /// coordinates; dividing by the material's source size normalises to 0..1 per
 /// tile. Values outside 0..1 are normal and must wrap, not clamp.
-fn texture_uv(position: [f32; 3], texinfo: &TexInfo, texdata: &DTexData) -> [f32; 2] {
+pub(crate) fn texture_uv(position: [f32; 3], texinfo: &TexInfo, texdata: &DTexData) -> [f32; 2] {
     // A zero here would mean a broken TEXDATA entry; 1 keeps the UV finite so
     // one bad material cannot poison the whole mesh.
     let width = if texdata.width != 0 {
@@ -359,7 +391,7 @@ fn texture_uv(position: [f32; 3], texinfo: &TexInfo, texdata: &DTexData) -> [f32
 /// by the face's luxel origin. The grid is one larger than
 /// `m_LightmapTextureSizeInLuxels` on each axis, and the half-luxel offset
 /// puts samples at texel centres rather than corners.
-fn lightmap_uv(position: [f32; 3], texinfo: &TexInfo, face: &DFace) -> [f32; 2] {
+pub(crate) fn lightmap_uv(position: [f32; 3], texinfo: &TexInfo, face: &DFace) -> [f32; 2] {
     let mins = face.lightmap_texture_mins_in_luxels;
     let (w, h) = (face.lightmap_width() as f32, face.lightmap_height() as f32);
     let lu = affine(position, texinfo.lightmap_vecs[0]) - mins[0] as f32;
@@ -369,13 +401,8 @@ fn lightmap_uv(position: [f32; 3], texinfo: &TexInfo, face: &DFace) -> [f32; 2] 
 
 /// Evaluate one of Source's `[x, y, z, offset]` affine texture planes.
 #[inline]
-fn affine(p: [f32; 3], v: [f32; 4]) -> f32 {
+pub(crate) fn affine(p: [f32; 3], v: [f32; 4]) -> f32 {
     p[0] * v[0] + p[1] * v[1] + p[2] * v[2] + v[3]
-}
-
-#[inline]
-fn negate(v: raw::Vec3) -> raw::Vec3 {
-    [-v[0], -v[1], -v[2]]
 }
 
 /// Whether fan triangle `(0, i, i + 1)` of `ring` has no area worth drawing.

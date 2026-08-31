@@ -10,6 +10,7 @@
 //! that yields no faces at all. Zero-area fan triangles are counted but are
 //! expected map content, not a failure.
 
+use bsp::displacement;
 use bsp::geometry::{self, ModelGeometry};
 use bsp::Bsp;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,27 @@ fn dump(path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     if surfaces.len() > 15 {
         println!("  ... and {} more materials", surfaces.len() - 15);
     }
+
+    let disp = displacement::build_displacements(&bsp)?;
+    let d = &disp.stats;
+    println!(
+        "
+  displacements: {}/{} built, {} materials, {} verts, {} tris",
+        d.built,
+        d.displacements,
+        disp.surfaces.len(),
+        disp.vertex_count(),
+        disp.triangle_count(),
+    );
+    println!(
+        "  skipped {}: {} bad power, {} bad face, {} no texinfo, {} short verts",
+        d.skipped(),
+        d.skipped_bad_power,
+        d.skipped_bad_face,
+        d.skipped_no_texinfo,
+        d.skipped_short_verts,
+    );
+    println!("  {} triangles tagged REMOVE", d.removed_triangles);
 
     // Brush entities: models 1.. hold doors, gates and moving platforms. The
     // viewer needs the ENTITIES lump to place them, which is M6's KeyValues
@@ -141,6 +163,8 @@ fn sweep(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let mut tot_degenerate = 0u64;
     let mut tot_bad_index = 0u64;
     let mut tot_too_few = 0u64;
+    let mut tot_disp = 0u64;
+    let mut tot_disp_removed = 0u64;
     let mut worst_materials = (0usize, String::new());
     let mut worst_tris = (0usize, String::new());
 
@@ -204,6 +228,27 @@ fn sweep(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
             }
         }
 
+        match displacement::build_displacements(&bsp) {
+            Ok(disp) => {
+                let d = &disp.stats;
+                verts += disp.vertex_count();
+                tris += disp.triangle_count();
+                tot_disp += d.built as u64;
+                tot_disp_removed += d.removed_triangles as u64;
+                if d.skipped() > 0 {
+                    problems.push(format!(
+                        "displacements: {} skipped ({} bad power, {} bad face,                          {} no texinfo, {} short verts)",
+                        d.skipped(),
+                        d.skipped_bad_power,
+                        d.skipped_bad_face,
+                        d.skipped_no_texinfo,
+                        d.skipped_short_verts,
+                    ));
+                }
+            }
+            Err(e) => problems.push(format!("displacements: {e}")),
+        }
+
         tot_verts += verts as u64;
         tot_tris += tris as u64;
         if materials > worst_materials.0 {
@@ -229,6 +274,8 @@ fn sweep(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     println!("  zero-area triangles dropped:   {tot_degenerate} (expected: collinear t-junction verts)");
     println!("  faces with bad edge indices:  {tot_bad_index}");
     println!("  faces with < 3 edges:         {tot_too_few}");
+    println!("  displacements built:           {tot_disp}");
+    println!("  displacement tris tagged REMOVE: {tot_disp_removed}");
     println!(
         "  heaviest: {} tris ({}), most materials: {} ({})",
         worst_tris.0, worst_tris.1, worst_materials.0, worst_materials.1,
