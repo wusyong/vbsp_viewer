@@ -11,10 +11,16 @@
 //! see its docs for why triangle winding survives untouched.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::Exposure;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::pbr::Lightmap;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bsp::displacement::DispGeometry;
 use bsp::geometry::{ModelGeometry, Surface};
+use bsp::lightmap::LightmapAtlas;
+use half::f16;
 
 /// Metres per Source unit.
 ///
@@ -50,6 +56,67 @@ pub fn src_to_bevy_dir(v: [f32; 3]) -> Vec3 {
 pub fn bevy_to_src(v: Vec3) -> [f32; 3] {
     let v = v / SOURCE_UNIT_METRES;
     [v.x, -v.z, v.y]
+}
+
+/// Source's `OVERBRIGHT`: `LightmappedGeneric` multiplies the baked lightmap
+/// by 2 before modulating albedo.
+///
+/// **Not** folded into [`lightmap_exposure`]. That factor exists to be
+/// cancelled by a real texture's reflectance — Source albedos average well
+/// under 0.5 — so applying it against the white placeholder just clips every
+/// sunlit surface to flat white. M8 applies it alongside `$basetexture`.
+pub const SOURCE_OVERBRIGHT: f32 = 2.0;
+
+/// The `StandardMaterial::lightmap_exposure` that makes a Source lightmap read
+/// correctly through Bevy's photographic pipeline.
+///
+/// Bevy grades PBR output by a camera exposure — the default is EV100 9.7, a
+/// multiplier of about 1/1000 — because its light intensities are in lux.
+/// Source's luxels are a plain reflectance factor around 1.0, so they have to
+/// be scaled by the inverse of that exposure to land back at unity. Deriving it
+/// rather than hardcoding 1000 keeps this correct if Bevy's default moves.
+pub fn lightmap_exposure() -> f32 {
+    1.0 / Exposure::default().exposure()
+}
+
+/// Upload a packed lightmap atlas as a texture.
+///
+/// `Rgba16Float`, because the atlas is **linear light with a peak above 1.0**
+/// (5.2 on `cp_badlands`) and an 8-bit format would clip every sunlit surface
+/// to white. Filtering is linear with no mips: mipping a lightmap atlas bleeds
+/// one face's lighting into its neighbours, and `ClampToEdge` keeps a UV that
+/// lands exactly on the far edge from wrapping to the opposite side.
+pub fn lightmap_image(atlas: &LightmapAtlas) -> Image {
+    let mut data = Vec::with_capacity(atlas.pixels.len() * 8);
+    for p in &atlas.pixels {
+        for c in p {
+            data.extend_from_slice(&f16::from_f32(*c).to_le_bytes());
+        }
+        // Alpha is unused by the lightmap shader but the format demands it.
+        data.extend_from_slice(&f16::from_f32(1.0).to_le_bytes());
+    }
+
+    let mut image = Image::new(
+        Extent3d {
+            width: atlas.width,
+            height: atlas.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba16Float,
+        // The atlas is never read back on the CPU after upload, and a 13 MiB
+        // copy per map is worth not keeping.
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    image
 }
 
 /// Marker for entities belonging to the currently loaded map, so a reload can
@@ -95,6 +162,15 @@ pub struct MapInfo {
     /// Model bounds in Source units.
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
+    /// Lightmap atlas dimensions, or zeroes when lightmaps are off.
+    pub lightmap_size: (u32, u32),
+    /// Faces given a rect in the atlas, and faces the compiler never lit.
+    pub lightmap_faces: usize,
+    pub lightmap_unlit: usize,
+    /// Fraction of the atlas that holds real samples.
+    pub lightmap_occupancy: f32,
+    /// Brightest luxel channel in the map, in linear light.
+    pub lightmap_peak: f32,
 }
 
 /// Build a Bevy mesh from one material's worth of BSP geometry.
@@ -153,6 +229,50 @@ pub fn debug_material_color(material: &str) -> Color {
     Color::hsl(hue, saturation, lightness)
 }
 
+/// The baked lighting to attach to spawned surfaces.
+///
+/// `uv_rect` is deliberately the whole texture: [`LightmapAtlas::remap`] has
+/// already rewritten `UV_1` into atlas space, and Bevy's own per-entity rect is
+/// stored as two `unorm16` pairs, so letting it do the mapping would quantise
+/// every rect to 1/65535 of the atlas.
+#[derive(Clone)]
+pub struct MapLightmap {
+    pub image: Handle<Image>,
+    pub exposure: f32,
+}
+
+impl MapLightmap {
+    fn component(&self) -> Lightmap {
+        Lightmap {
+            image: self.image.clone(),
+            uv_rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+            bicubic_sampling: false,
+        }
+    }
+}
+
+/// What a map contributes to every surface it spawns: the material names to
+/// resolve a `texdata` index against, and the bake to attach.
+///
+/// These always travel together — a lightmap is packed for exactly the faces
+/// of the geometry being spawned — so they are one parameter rather than two.
+#[derive(Clone, Copy)]
+pub struct MapSurfaces<'a> {
+    /// Indexed by TEXDATA index; see [`bsp::Bsp::texture_names`].
+    pub material_names: &'a [&'a str],
+    /// `None` renders with the debug palette and no baked lighting.
+    pub lightmap: Option<&'a MapLightmap>,
+}
+
+impl MapSurfaces<'_> {
+    fn name(&self, texdata: i32) -> &str {
+        usize::try_from(texdata)
+            .ok()
+            .and_then(|i| self.material_names.get(i).copied())
+            .unwrap_or("<unknown>")
+    }
+}
+
 /// Spawn one built model as a set of per-material mesh entities.
 ///
 /// `origin` is the entity origin for a brush model; worldspawn passes zero.
@@ -163,28 +283,34 @@ pub fn spawn_model(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     geometry: &ModelGeometry,
-    material_names: &[&str],
+    surfaces: MapSurfaces,
     origin: [f32; 3],
     parent_name: &str,
 ) -> usize {
     let translation = src_to_bevy(origin);
 
+    let lightmap = surfaces.lightmap;
     for surface in &geometry.surfaces {
-        let name = usize::try_from(surface.texdata)
-            .ok()
-            .and_then(|i| material_names.get(i).copied())
-            .unwrap_or("<unknown>");
+        let name = surfaces.name(surface.texdata);
 
         let material = materials.add(StandardMaterial {
-            base_color: debug_material_color(name),
+            // White albedo under a lightmap: what is on screen is then the
+            // bake itself, which is the only way to tell a lighting bug from a
+            // material bug. The viewer swaps in `debug_material_color` on
+            // demand.
+            base_color: match lightmap {
+                Some(_) => Color::WHITE,
+                None => debug_material_color(name),
+            },
             perceptual_roughness: 0.9,
+            lightmap_exposure: lightmap.map_or(0.0, |l| l.exposure),
             // Backface culling stays ON deliberately: it is the only cheap
             // check that winding and normals actually agree with the BSP. With
             // it disabled, inverted geometry looks perfectly fine.
             ..default()
         });
 
-        commands.spawn((
+        let mut entity = commands.spawn((
             Mesh3d(meshes.add(surface_to_mesh(surface))),
             MeshMaterial3d(material),
             Transform::from_translation(translation),
@@ -198,6 +324,9 @@ pub fn spawn_model(
             },
             Name::new(format!("{parent_name}:{name}")),
         ));
+        if let Some(lightmap) = lightmap {
+            entity.insert(lightmap.component());
+        }
     }
 
     geometry.surfaces.len()
@@ -213,21 +342,23 @@ pub fn spawn_displacements(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     geometry: &DispGeometry,
-    material_names: &[&str],
+    surfaces: MapSurfaces,
 ) -> usize {
+    let lightmap = surfaces.lightmap;
     for surface in &geometry.surfaces {
-        let name = usize::try_from(surface.texdata)
-            .ok()
-            .and_then(|i| material_names.get(i).copied())
-            .unwrap_or("<unknown>");
+        let name = surfaces.name(surface.texdata);
 
         let material = materials.add(StandardMaterial {
-            base_color: debug_material_color(name),
+            base_color: match lightmap {
+                Some(_) => Color::WHITE,
+                None => debug_material_color(name),
+            },
             perceptual_roughness: 0.95,
+            lightmap_exposure: lightmap.map_or(0.0, |l| l.exposure),
             ..default()
         });
 
-        commands.spawn((
+        let mut entity = commands.spawn((
             Mesh3d(meshes.add(surface_to_mesh(surface))),
             MeshMaterial3d(material),
             Transform::IDENTITY,
@@ -241,6 +372,9 @@ pub fn spawn_displacements(
             },
             Name::new(format!("displacement:{name}")),
         ));
+        if let Some(lightmap) = lightmap {
+            entity.insert(lightmap.component());
+        }
     }
     geometry.surfaces.len()
 }
@@ -251,6 +385,7 @@ pub fn map_info(
     bsp_version: i32,
     geometry: &ModelGeometry,
     displacements: &DispGeometry,
+    atlas: Option<&LightmapAtlas>,
 ) -> MapInfo {
     MapInfo {
         name: name.to_string(),
@@ -266,6 +401,11 @@ pub fn map_info(
         displacement_triangles: displacements.triangle_count(),
         mins: geometry.mins,
         maxs: geometry.maxs,
+        lightmap_size: atlas.map_or((0, 0), |a| (a.width, a.height)),
+        lightmap_faces: atlas.map_or(0, |a| a.stats.faces_packed),
+        lightmap_unlit: atlas.map_or(0, |a| a.stats.faces_unlit),
+        lightmap_occupancy: atlas.map_or(0.0, |a| a.stats.occupancy(a.pixel_count())),
+        lightmap_peak: atlas.map_or(0.0, |a| a.stats.peak),
     }
 }
 

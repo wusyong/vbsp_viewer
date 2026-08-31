@@ -265,9 +265,9 @@ The mixed-winding count was the tell: an all-or-nothing invariant (a cyclic corn
   h = m_LightmapTextureSizeInLuxels[1] + 1
   numluxels = w * h
   ```
-- **Layout subtlety (get this right or lighting will be offset by a few bytes per face):** `lightofs` already points *past* a `lightstyles * 4` byte block of average-face-colour data that vrad writes immediately before the samples ([lightmap.cpp:3395-3397](../../source-sdk-2013/src/utils/vrad/lightmap.cpp#L3395-L3397)). Samples are then ordered `[style][bumpSample][luxel]`, where `bumpSampleCount = 4` if `texinfo.flags & SURF_BUMPLIGHT` else `1` ([radial.cpp:737](../../source-sdk-2013/src/utils/vrad/radial.cpp#L737)). **For phase 1 read style 0, bumpSample 0 — the first `numluxels` entries at `lightofs`.**
+- **Layout subtlety (get this right or lighting will be offset by a few bytes per face):** `lightofs` already points *past* a `lightstyles * 4` byte block of average-face-colour data that vrad writes immediately before the samples ([lightmap.cpp:3395-3397](../../source-sdk-2013/src/utils/vrad/lightmap.cpp#L3395-L3397)). Samples are then ordered `[style][bumpSample][luxel]`, where `bumpSampleCount = 4` if `texinfo.flags & SURF_BUMPLIGHT` else `1` ([radial.cpp:737](../../source-sdk-2013/src/utils/vrad/radial.cpp#L737)). **For phase 1 read style 0, bumpSample 0 — the first `numluxels` entries at `lightofs`.** Within a face, samples are row-major with S fastest: `luxel[s + t * width]`.
 - Decode: `linear_rgb = vec3(r, g, b) * exp2(exponent) / 255.0` — the bytes are **linear**, not sRGB.
-- Pack every face's `w × h` rect into one atlas (skyline/shelf packer). **Add a 1px border by duplicating edge luxels** — without it, bilinear filtering bleeds neighbouring faces' lighting across seams. Emit as `Rgba16Float` to preserve the exponent range (`Rgba8UnormSrgb` after tonemap is an acceptable fallback but clips bright outdoor luxels).
+- Pack every face's `w × h` rect into one atlas (skyline/shelf packer). **Add a 1px border by duplicating edge luxels** — without it, bilinear filtering bleeds neighbouring faces' lighting across seams. Emit as `Rgba16Float` to preserve the exponent range (~~`Rgba8UnormSrgb` after tonemap is an acceptable fallback~~ — it is not; see M5 findings, peak luxels reach 359).
 - Lightmap UV per vertex, in Source space:
   ```
   lu = dot(pos, lmVecs[0].xyz) + lmVecs[0][3] - m_LightmapTextureMinsInLuxels[0]
@@ -279,6 +279,28 @@ The mixed-winding count was the tell: an all-or-nothing invariant (a cyclic corn
 - Faces with `texinfo.flags & (SURF_SKY | SURF_NOLIGHT)` (vrad's `TEX_SPECIAL`, [vrad.h:432](../../source-sdk-2013/src/utils/vrad/vrad.h#L432)) have no lightmap at all.
 
 **Verify:** dump the atlas to PNG and inspect. In-window: interiors dark, open ground bright, shadow shapes matching the real game. This step is where a viewer starts to look like TF2 even with white albedo.
+
+### M5 findings
+
+Lighting in. `cp_badlands` packs 12 978 faces into a **2048 × 865** atlas at 89% occupancy; `ctf_2fort` 13 735 faces into 2048 × 994 at 93%. The atlas dump (`lmdump --bmp`) shows per-face shadow patterns and the desert palette, and in-window the mesa casts a soft shadow across the terrain below it with no seam between brush and displacement lighting.
+
+**The plan's layout warning was right, and worth the citations.** `PrecompLightmapOffsets` reserves `lightstyles * 4` bytes of average-face-colour *before* setting `f->lightofs`, and `radial.cpp` indexes samples as `lightofs + (style * bumpSampleCount + bumpSample) * numluxels * 4`. Style 0, bump 0 is therefore the first `numluxels` samples at `lightofs`, exactly as written. One detail the plan omitted: within a face, samples are row-major with **S fastest** — `luxel[s + t * width]` ([lightmap.cpp:863](../../source-sdk-2013/src/utils/vrad/lightmap.cpp#L863)). Getting that backwards transposes every face's lighting, which on square faces is invisible in aggregate statistics.
+
+**A float atlas is not optional.** Measured peak luxel channel, in linear light: 5.2 on `cp_badlands`, 14.2 on `ctf_2fort`, **359.4** on `mvm_decoy`. `Rgba8UnormSrgb` would clip every one of those to white — the plan listed 8-bit as an "acceptable fallback"; it is not. `Rgba16Float` covers all 233 maps.
+
+**Shelf packing is enough; a skyline packer would be over-engineering.** Sorting faces tallest-first makes each shelf near-uniform in height: occupancy across all 233 maps is **84–98%, mean 93%**. Atlas width is chosen as the power of two nearest `sqrt(padded_area)`, so small maps get small atlases (1024 × 807 for `zi_woods`) and the largest, `pl_redwood`, lands at 4096 × 1872 — 58 MiB, well inside WebGPU's 8192px floor for `maxTextureDimension2D`. Cap and error variant exist for corrupt lumps, not for anything Valve shipped.
+
+**Bevy's own `Lightmap` component does the job, with one trap.** `bevy_pbr::lightmap` computes `mix(uv_rect.xy, uv_rect.zw, uv)` and stores that rect as two `unpack2x16unorm` pairs. Letting Bevy do the per-entity atlas mapping would quantise every rect to 1/65535 of the atlas; instead `UV_1` is pre-remapped into atlas space and `uv_rect` is the whole texture, which is exact and also lets every surface share one image. Two further requirements: `GlobalAmbientLight::affects_lightmapped_meshes = false` (Bevy adds ambient *on top of* a lightmap by default, lifting every shadow off the floor), and no directional light at all — any second light source papers over a wrong bake, which is the one thing this milestone has to be able to see.
+
+**`lightmap_exposure` is a unit conversion, not a taste knob.** Bevy grades PBR output through a photographic exposure (`Exposure::default()` is EV100 9.7 ≈ ×1/1000) because its light intensities are in lux; a Source luxel is a reflectance factor around 1.0. So the exposure is derived as `1.0 / Exposure::default().exposure()` rather than hardcoded, and `--lightmap-exposure` overrides it. **Source's `OVERBRIGHT` of 2.0 is deliberately *not* folded in** — that factor exists to be cancelled by a real texture's reflectance, and against the white placeholder albedo it just clips sunlit surfaces. M8 applies it alongside `$basetexture`.
+
+**Displacements needed the border the plan asked for, for a reason it did not give.** A brush face's own luxel coordinates sit half a luxel inside its grid, so bilinear taps stay interior *for exact arithmetic*. Displaced vertices do not: they project outside their parent face's luxel extent. `remap` clamps into the padded rect, so an overshoot repeats the edge colour instead of reaching a neighbour's rect — and the sweep asserts zero remapped UVs outside the atlas, which is what would catch the clamp being wrong.
+
+**Acceptance gate passed:** all **233 maps, 0 failures** — **3 048 836 faces packed**, 316 M luxels, 24 513 unlit faces (`TEX_SPECIAL` / `styles[0] == 255`, pointed at a fullbright block rather than left to sample atlas origin), **0 faces with a bad sample range** and **0 remapped UVs outside the atlas**.
+
+- Faces the compiler never lit get a 1 × 1 white block, not black and not a silent wrap to (0, 0).
+- Both builders already recorded their source face per chunk from M2/M4, so brush and terrain go through one atlas with no extra plumbing — a displacement's lighting lives on its parent face.
+- F5 swaps white albedo for the debug palette; the palette is now modulated by real lighting instead of replacing it.
 
 ### M6 — VFS: gameinfo, VPK v2, pakfile, VMT
 
@@ -351,6 +373,7 @@ Available and confirmed on crates.io. The published `vbsp` 0.9.1 / `vtf` 0.4.1 /
 ```bash
 cargo test --workspace                  # struct sizes, KV/VMT/VPK unit tests
 cargo run -p bsp --example lumpdump -- --all-maps "<tf dir>"   # all 233 maps, 0 errors
+cargo run -p bsp --example lmdump   -- --all-maps "<tf dir>"   # lightmap atlas for every map
 ```
 The all-maps sweep is the highest-value test in phase 1 — it catches version drift, `dleaf_t` v0/v1 branching, unusual displacement powers, and community-map edge cases in one command.
 

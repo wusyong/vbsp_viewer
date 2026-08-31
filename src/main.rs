@@ -8,7 +8,8 @@
 //!
 //! Controls: WASD to move, Q/E down/up, hold Shift to sprint, click to capture
 //! the mouse and Escape to release. F1 toggles the overlay, F2 wireframe,
-//! F3 hides brush geometry.
+//! F3 hides brush geometry, F4 terrain, and F5 swaps white albedo for the
+//! per-material debug palette.
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::pbr::wireframe::{WireframeConfig, WireframePlugin};
@@ -69,6 +70,16 @@ struct Args {
     /// Camera yaw and pitch in degrees, as `yaw,pitch`.
     #[arg(long, value_parser = parse_angles, allow_hyphen_values = true)]
     angles: Option<Vec2>,
+
+    /// Skip the baked lightmaps and light the map with a debug directional
+    /// light instead — the M3/M4 look, useful for judging geometry alone.
+    #[arg(long)]
+    no_lightmap: bool,
+
+    /// Override the lightmap brightness. Defaults to the value that maps a
+    /// luxel of 1.0 onto full exposure; see `bevy_bsp::lightmap_exposure`.
+    #[arg(long)]
+    lightmap_exposure: Option<f32>,
 }
 
 /// Parse `x,y,z` in Source units into a Bevy-space position.
@@ -182,6 +193,7 @@ fn main() -> AppExit {
         .insert_resource(args)
         .init_resource::<MapInfo>()
         .init_resource::<FrameRate>()
+        .init_resource::<AlbedoMode>()
         // Chained, not a bare tuple: `load_map` repositions the camera that
         // `setup_scene` spawns, and an ordering edge is what makes Bevy insert
         // the sync point that flushes the spawn command first. Unordered, the
@@ -193,6 +205,7 @@ fn main() -> AppExit {
                 grab_cursor,
                 fly_camera,
                 toggle_debug_views,
+                swap_albedo,
                 (tick_frame_rate, update_hud).chain(),
                 capture_screenshot,
             ),
@@ -269,19 +282,27 @@ fn setup_scene(mut commands: Commands, args: Res<Args>) {
         },
     ));
 
-    // Flat debug colours need some directional shading to read as geometry.
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 6_000.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.6, -0.9, 0.0)),
-    ));
+    // With lightmaps on, the scene is lit *only* by the bake — no directional
+    // light, no ambient. Any extra light source would paper over a wrong
+    // lightmap, which is exactly what this milestone has to be able to see.
+    // `--no-lightmap` restores the flat debug lighting from M3/M4.
+    if args.no_lightmap {
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 6_000.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, -0.6, -0.9, 0.0)),
+        ));
+    }
     // `AmbientLight` is a per-camera component in Bevy 0.19; the scene-wide
     // default is the `GlobalAmbientLight` resource.
     commands.insert_resource(GlobalAmbientLight {
-        brightness: 1_200.0,
+        brightness: if args.no_lightmap { 1_200.0 } else { 0.0 },
+        // Bevy adds ambient on top of a lightmap by default, which would lift
+        // every shadow off the floor.
+        affects_lightmapped_meshes: false,
         ..default()
     });
 
@@ -313,10 +334,14 @@ fn setup_scene(mut commands: Commands, args: Res<Args>) {
 /// is memory-mapped and lives outside the asset directory, and a map builds in
 /// well under a frame budget's worth of patience. Async loading and
 /// hot-reloading are worth revisiting once there is more than one map in play.
+// Bevy systems take their dependencies as parameters, so the count here is
+// the injection list, not a signature that wants shortening.
+#[allow(clippy::too_many_arguments)]
 fn load_map(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut info: ResMut<MapInfo>,
     mut camera: Query<(&mut Transform, &mut FlyCamera)>,
     path: Res<MapPath>,
@@ -331,7 +356,7 @@ fn load_map(
             return;
         }
     };
-    let world = match bsp::geometry::build_worldspawn(&bsp) {
+    let mut world = match bsp::geometry::build_worldspawn(&bsp) {
         Ok(g) => g,
         Err(e) => {
             error!("failed to build geometry: {e}");
@@ -352,7 +377,7 @@ fn load_map(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let displacements = match bsp::displacement::build_displacements(&bsp) {
+    let mut displacements = match bsp::displacement::build_displacements(&bsp) {
         Ok(d) => d,
         Err(e) => {
             error!("failed to tessellate displacements: {e}");
@@ -360,12 +385,47 @@ fn load_map(
         }
     };
 
+    // Pack the bake, then rewrite UV_1 in place. Both builders record their
+    // source face per chunk, so brush and terrain surfaces go through the same
+    // atlas — a displacement's lighting lives on its parent face.
+    let atlas = if args.no_lightmap {
+        None
+    } else {
+        let faces: Vec<u32> = bsp::lightmap::faces_of(&world.surfaces)
+            .chain(bsp::lightmap::faces_of(&displacements.surfaces))
+            .collect();
+        match bsp::lightmap::build(&bsp, faces, bsp::lightmap::Lighting::Ldr) {
+            Ok(atlas) => {
+                atlas.remap(&mut world.surfaces);
+                atlas.remap(&mut displacements.surfaces);
+                Some(atlas)
+            }
+            Err(e) => {
+                // Worth continuing without: the geometry is still useful, and
+                // a silent fallback to fullbright would be indistinguishable
+                // from a black bake.
+                error!("failed to pack lightmaps, rendering unlit: {e}");
+                None
+            }
+        }
+    };
+    let lightmap = atlas.as_ref().map(|atlas| bevy_bsp::MapLightmap {
+        image: images.add(bevy_bsp::lightmap_image(atlas)),
+        exposure: args
+            .lightmap_exposure
+            .unwrap_or_else(bevy_bsp::lightmap_exposure),
+    });
+
+    let surfaces = bevy_bsp::MapSurfaces {
+        material_names: &names,
+        lightmap: lightmap.as_ref(),
+    };
     let draw_calls = bevy_bsp::spawn_model(
         &mut commands,
         &mut meshes,
         &mut materials,
         &world,
-        &names,
+        surfaces,
         [0.0; 3],
         "worldspawn",
     );
@@ -374,9 +434,15 @@ fn load_map(
         &mut meshes,
         &mut materials,
         &displacements,
-        &names,
+        surfaces,
     );
-    *info = bevy_bsp::map_info(&map_name, bsp.version(), &world, &displacements);
+    *info = bevy_bsp::map_info(
+        &map_name,
+        bsp.version(),
+        &world,
+        &displacements,
+        atlas.as_ref(),
+    );
 
     let start = default_viewpoint(&world);
     if let Ok((mut transform, mut fly)) = camera.single_mut() {
@@ -602,6 +668,50 @@ fn toggle_debug_views(
     }
 }
 
+/// Whether surfaces render with white albedo or the per-material debug palette.
+///
+/// White is the default under lightmaps, so what reaches the screen *is* the
+/// bake; the palette is still the fastest way to see how a map is carved up by
+/// material, now modulated by real lighting.
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+enum AlbedoMode {
+    #[default]
+    White,
+    DebugPalette,
+}
+
+/// Repaint every surface's material on F5.
+///
+/// Editing the material assets in place rather than swapping handles keeps one
+/// material per surface, so the draw call count in the HUD stays honest.
+fn swap_albedo(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut mode: ResMut<AlbedoMode>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    surfaces: Query<(&SurfaceInfo, &MeshMaterial3d<StandardMaterial>)>,
+    args: Res<Args>,
+) {
+    // Without a lightmap the palette *is* the render, so there is nothing to
+    // toggle to.
+    if !keys.just_pressed(KeyCode::F5) || args.no_lightmap {
+        return;
+    }
+
+    *mode = match *mode {
+        AlbedoMode::White => AlbedoMode::DebugPalette,
+        AlbedoMode::DebugPalette => AlbedoMode::White,
+    };
+    for (surface, handle) in &surfaces {
+        let Some(mut material) = materials.get_mut(&handle.0) else {
+            continue;
+        };
+        material.base_color = match *mode {
+            AlbedoMode::White => Color::WHITE,
+            AlbedoMode::DebugPalette => bevy_bsp::debug_material_color(&surface.material),
+        };
+    }
+}
+
 /// Frames to ignore before measuring. Window creation and shader pipeline
 /// compilation make the first frames wildly unrepresentative, and an average
 /// seeded from them reads high for a long time — high enough to report a frame
@@ -627,6 +737,9 @@ fn tick_frame_rate(mut rate: ResMut<FrameRate>, time: Res<Time>) {
     rate.fps += (1.0 / dt - rate.fps) * alpha;
 }
 
+// Bevy systems take their dependencies as parameters, so the count here is
+// the injection list, not a signature that wants shortening.
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     mut hud: Query<&mut Text, With<HudText>>,
     camera: Query<&Transform, With<FlyCamera>>,
@@ -634,6 +747,7 @@ fn update_hud(
     info: Res<MapInfo>,
     rate: Res<FrameRate>,
     wireframe: Res<WireframeConfig>,
+    mode: Res<AlbedoMode>,
     args: Res<Args>,
 ) {
     let vsync = !args.no_vsync;
@@ -654,11 +768,12 @@ fn update_hud(
          {} materials  {} verts  {} tris  {} draw calls\n\
          terrain {} disps  {} verts  {} tris\n\
          faces {}/{}  ({} on displacements)\n\
+         lightmap {}\n\
          pos {x:.0} {y:.0} {z:.0} (Source units)\n\
          {:.1} ms/frame  ({:.0} fps{}){}\n\
          \n\
          WASD/QE move, Shift sprint, click to look, Esc release\n\
-         F1 overlay  F2 wireframe  F3 brushes  F4 terrain",
+         F1 overlay  F2 wireframe  F3 brushes  F4 terrain  F5 albedo",
         info.name,
         info.bsp_version,
         info.materials,
@@ -671,6 +786,7 @@ fn update_hud(
         info.faces_built,
         info.faces_total,
         info.displacement_faces,
+        lightmap_summary(&info, *mode),
         rate.frame_ms,
         rate.fps,
         if vsync { ", vsync" } else { "" },
@@ -708,4 +824,25 @@ fn capture_screenshot(
         }
         _ => {}
     }
+}
+
+/// The HUD's lightmap line: atlas size, how much of it holds real samples, and
+/// how many faces the compiler left unlit.
+fn lightmap_summary(info: &MapInfo, mode: AlbedoMode) -> String {
+    if info.lightmap_faces == 0 {
+        return "off".to_string();
+    }
+    format!(
+        "{}x{} atlas  {:.0}% packed  {} faces  {} unlit  peak {:.1}  albedo {}",
+        info.lightmap_size.0,
+        info.lightmap_size.1,
+        info.lightmap_occupancy * 100.0,
+        info.lightmap_faces,
+        info.lightmap_unlit,
+        info.lightmap_peak,
+        match mode {
+            AlbedoMode::White => "white",
+            AlbedoMode::DebugPalette => "palette",
+        },
+    )
 }

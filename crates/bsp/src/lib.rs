@@ -18,6 +18,7 @@
 pub mod displacement;
 pub mod flags;
 pub mod geometry;
+pub mod lightmap;
 pub mod lump;
 pub mod raw;
 
@@ -122,6 +123,11 @@ pub enum BspError {
 
     #[error("lump {lump}: string at offset {ofs} is not NUL-terminated")]
     UnterminatedString { lump: &'static str, ofs: usize },
+
+    #[error(
+        "lightmap atlas would be {width}x{height}, past the {max}px limit          this reader packs into a single texture"
+    )]
+    LightmapAtlasTooLarge { width: u32, height: u32, max: u32 },
 }
 
 /// Convenience alias used throughout the crate.

@@ -11,6 +11,7 @@ clap      = { version = "4", features = ["derive"] }
 bytemuck  = { version = "1", features = ["derive"] }
 memmap2   = "0.9"
 lzma-rs   = "0.3"
+half      = "2"
 thiserror = "2"
 
 [profile.dev]
