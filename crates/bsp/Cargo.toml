@@ -1,0 +1,11 @@
+[package]
+name = "bsp"
+version = "0.1.0"
+edition = "2024"
+description = "Reader for Valve Source engine BSP (VBSP) map files"
+
+[dependencies]
+bytemuck.workspace = true
+memmap2.workspace = true
+lzma-rs.workspace = true
+thiserror.workspace = true
