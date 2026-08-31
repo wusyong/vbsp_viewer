@@ -65,6 +65,8 @@ struct Toggles {
     cull_override: Option<bool>,
     surface: Surface,
     lightmap_exposure: f32,
+    /// The 3D skybox, hideable on its own. `TF2_NO_SKY3D=1` starts it off.
+    show_sky_3d: bool,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -118,6 +120,7 @@ fn main() {
                 Surface::Textured
             },
             lightmap_exposure: bsp::lightmap_exposure(),
+            show_sky_3d: !flag("TF2_NO_SKY3D"),
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -136,6 +139,7 @@ fn main() {
                 fly_cam,
                 input,
                 apply_view,
+                apply_sky_3d.after(apply_view),
                 apply_toggles,
                 apply_lightmap_exposure,
                 fix_reference_materials,
@@ -228,6 +232,12 @@ fn input(keys: Res<ButtonInput<KeyCode>>, mut view: ResMut<View>, mut toggles: R
     if keys.just_pressed(KeyCode::KeyT) {
         toggles.surface = toggles.surface.next();
     }
+    // `K` hides the 3D skybox. Not a gimmick: the whole difficulty of 1.5d was
+    // that its geometry is indistinguishable from the map's, so being able to
+    // blink it out is how you check the split took nothing it should not have.
+    if keys.just_pressed(KeyCode::KeyK) {
+        toggles.show_sky_3d = !toggles.show_sky_3d;
+    }
     // Lightmap brightness has no principled value — it is the conversion between
     // Source's light units and Bevy's, found by eye. Keep the knob to hand.
     if keys.just_pressed(KeyCode::Minus) {
@@ -273,6 +283,25 @@ fn apply_view(
     }
     for mut v in &mut ours {
         show(&mut v, matches!(*view, View::Bsp | View::Both));
+    }
+}
+
+/// Hide or show the 3D skybox root.
+///
+/// Runs after `apply_view`, which sets visibility on everything carrying
+/// `BspGeometry` — the sky root included, since it is part of our geometry. This
+/// re-hides it afterwards; the other order would have `apply_view` silently undo
+/// the toggle whenever the view changed.
+fn apply_sky_3d(
+    toggles: Res<Toggles>,
+    mut roots: Query<&mut Visibility, With<bsp::SkyBoxRoot>>,
+) {
+    for mut v in &mut roots {
+        *v = if toggles.show_sky_3d {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
@@ -407,7 +436,8 @@ fn report(
         toggles.surface.label(),
     ));
     out.push_str(&format!(
-        "[- =] lightmap exposure {:.1}\n",
+        "[K] 3d skybox: {}   [- =] lightmap exposure {:.1}\n",
+        if toggles.show_sky_3d { "on" } else { "off" },
         toggles.lightmap_exposure
     ));
     out.push_str(&format!(
@@ -506,6 +536,16 @@ fn headless_capture(
     mut shot: Local<bool>,
     mut quit: MessageWriter<AppExit>,
 ) {
+    // `--probe` is `--shot` without the picture: load the map, render one frame
+    // so anything the GPU would reject actually gets submitted, then quit. It
+    // exists to sweep the whole map library in a couple of minutes and find out
+    // which maps we cannot read, rather than knowing only that ctf_2fort works.
+    if std::env::args().any(|a| a == "--probe") {
+        if time.elapsed_secs() > 1.0 {
+            quit.write(AppExit::Success);
+        }
+        return;
+    }
     if !std::env::args().any(|a| a == "--shot") {
         return;
     }

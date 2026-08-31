@@ -119,6 +119,99 @@ pub fn brush_models(bsp: &Bsp) -> Vec<BrushModel> {
     models
 }
 
+/// The map's 3D skybox: distant scenery built at 1/`scale` size off to one side
+/// and composited by a second camera, which a loader that walks model 0 gets
+/// mixed in with the playable map at its authored position and size.
+///
+/// On ctf_2fort that is 127 faces and 4,708 triangles, almost all of it the
+/// `farm_fields001` dune landscape. Untransformed it sits ~90-145 m from the
+/// origin along one axis at roughly ground level -- so on this map the symptom
+/// is not scenery looming over the playfield but scenery that is *missing*: a
+/// 1/16-scale terrain parked off to one side, mostly outside the view. The
+/// barns and sandy plateau visible above 2fort are the playable map's own
+/// geometry, and they stay put when this is hidden.
+pub struct SkyBox3d {
+    /// `sky_camera`'s position, in Source units. The point that maps to the
+    /// world origin.
+    pub origin: Vec3,
+    /// `sky_camera`'s `scale`, 16 on every stock map.
+    pub scale: f32,
+    /// World-space bounds of the volume, in Source units.
+    pub min: Vec3,
+    pub max: Vec3,
+    pub faces: usize,
+    pub triangles: usize,
+}
+
+impl SkyBox3d {
+    fn contains(&self, p: Vec3) -> bool {
+        (0..3).all(|i| p[i] >= self.min[i] && p[i] <= self.max[i])
+    }
+}
+
+/// Locate the 3D skybox, if the map has one.
+///
+/// Three identifications that look reasonable and are not:
+///
+/// - **Bounds.** The 3D skybox has its own `toolsskybox` shell, so the map-wide
+///   boxes overlap almost completely.
+/// - **Texture name.** `skybox/` is a convention, and it catches water named
+///   `water_2fort_skybox_*`. Worse, five of ctf_2fort's seven skybox textures
+///   are *also* used in the playable map -- its miniature bridge reuses
+///   `wood_bridge001` -- so no per-material split can work.
+/// - **BSP areas.** ctf_2fort has no areaportals; all 7,971 leaves are area 0.
+///
+/// What works is visibility. The skybox is a sealed room, so the PVS of the leaf
+/// holding `sky_camera` is a closed set -- on ctf_2fort, exactly one cluster of
+/// 2,489, spanning 48 leaves. Union those leaves' bounds and the region falls
+/// out, compact and nowhere near the playable map.
+///
+/// The bounds are then used as a *geometric* test rather than attributing faces
+/// through `leaf_faces` directly, and that is not a shortcut: **displacements
+/// are absent from `leaf_faces` entirely**, so attribution misses
+/// `farm_fields001` -- 4,544 of the skybox's 4,708 triangles, the whole terrain.
+pub fn sky_3d(bsp: &Bsp) -> Option<SkyBox3d> {
+    let camera = bsp
+        .entities
+        .iter()
+        .find(|e| e.prop("classname") == Some("sky_camera"))?;
+    let origin = Vec3::from_array(
+        camera
+            .prop_parse::<[f32; 3]>("origin")
+            .and_then(Result::ok)?,
+    );
+    let scale = camera
+        .prop_parse::<f32>("scale")
+        .and_then(Result::ok)
+        .unwrap_or(16.0);
+
+    let leaf = bsp.leaf_at(origin)?;
+    if leaf.cluster < 0 {
+        return None;
+    }
+    let visible: Vec<u32> = bsp.vis_data.visible_clusters(leaf.cluster as u32).collect();
+
+    let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let mut found = false;
+    for i in 0..bsp.leaves.len() {
+        let Some(leaf) = bsp.leaf(i) else { continue };
+        if leaf.cluster < 0 || !visible.contains(&(leaf.cluster as u32)) {
+            continue;
+        }
+        found = true;
+        min = min.min(leaf.mins);
+        max = max.max(leaf.maxs);
+    }
+    found.then_some(SkyBox3d {
+        origin,
+        scale,
+        min,
+        max,
+        faces: 0,
+        triangles: 0,
+    })
+}
+
 /// One mesh per distinct texture. A TF2 map has thousands of faces and a few
 /// hundred textures; one entity per face would tank frame time for nothing.
 pub struct Batch {
@@ -126,6 +219,9 @@ pub struct Batch {
     pub debug_color: Color,
     pub mesh: Mesh,
     pub triangles: usize,
+    /// Belongs to the 3D skybox, so it is spawned under a different root with
+    /// the `(p - sky_origin) * scale` transform applied.
+    pub is_sky: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -165,6 +261,7 @@ pub struct Stats {
 struct Accum {
     texture: String,
     debug_color: [u8; 3],
+    is_sky: bool,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
@@ -176,14 +273,15 @@ struct Accum {
     indices: Vec<u32>,
 }
 
-pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
+pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats, Option<SkyBox3d>) {
     let start = Instant::now();
     let mut stats = Stats::default();
+    let mut sky = sky_3d(bsp);
 
-    // Keyed on texture_data_index rather than the texture name vbspview groups
-    // by: same grouping, since the name is looked up through texture_data, but
-    // an integer key avoids hashing a string per face.
-    let mut accums: HashMap<i32, Accum> = HashMap::new();
+    // Keyed on `(texture_data_index, is_sky)`, not the index alone. The skybox
+    // shares five of its seven materials with the playable map, so a batch keyed
+    // on texture would mix geometry that needs two different transforms.
+    let mut accums: HashMap<(i32, bool), Accum> = HashMap::new();
 
     let placements = brush_models(bsp);
     stats.models_used = placements.len();
@@ -206,18 +304,39 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
                 stats.faces_tool += 1;
                 continue;
             }
+            // Classify against the 3D skybox region *in world space*: the face
+            // positions are model-local, so the brush entity's origin has to go
+            // on first. Miss that and the skybox's own cloud brushes -- which
+            // are func_brush models sitting at the sky_camera -- test at the
+            // world origin and land on the wrong side.
+            let in_sky = sky.as_ref().is_some_and(|s| {
+                let mut sum = Vec3::ZERO;
+                let mut n = 0.0f32;
+                for v in face.vertex_positions() {
+                    sum += v;
+                    n += 1.0;
+                }
+                n > 0.0 && s.contains(sum / n + placement.origin)
+            });
+
             let accum = accums
-                .entry(texture.texture_data_index)
+                .entry((texture.texture_data_index, in_sky))
                 .or_insert_with(|| Accum {
                     texture: texture.name().to_string(),
                     debug_color: texture.debug_color(),
+                    is_sky: in_sky,
                     ..default()
                 });
             let patch = lightmaps.uv_rect(face_id);
             if patch.is_some() {
                 stats.faces_lit += 1;
             }
+            let before = accum.indices.len();
             push_face(accum, &face, &texture, placement.origin, patch, &mut stats);
+            if in_sky && let Some(s) = sky.as_mut() {
+                s.faces += 1;
+                s.triangles += (accum.indices.len() - before) / 3;
+            }
             stats.faces_drawn += 1;
         }
     }
@@ -233,6 +352,7 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
                 texture: a.texture,
                 debug_color: Color::srgb_u8(r, g, b),
                 triangles,
+                is_sky: a.is_sky,
                 mesh: Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
                     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, a.positions)
                     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, a.normals)
@@ -245,7 +365,7 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats) {
     batches.sort_by_key(|b| std::cmp::Reverse(b.triangles));
 
     stats.build_time = start.elapsed();
-    (batches, stats)
+    (batches, stats, sky)
 }
 
 

@@ -55,6 +55,12 @@ pub fn bsp_path() -> PathBuf {
 #[derive(Component)]
 pub struct BspGeometry;
 
+/// The 3D skybox root. Separate from `BspGeometry` so the scenery can be hidden
+/// on its own -- worth having, since the whole point of 1.5d is that it used to
+/// be indistinguishable from the map.
+#[derive(Component)]
+pub struct SkyBoxRoot;
+
 /// Three materials per batch. `textured` is the real one; the other two are
 /// diagnostics worth keeping — a face batched under the wrong texture is
 /// obvious in debug colour and invisible under a texture, and `plain` isolates
@@ -162,7 +168,7 @@ fn load_bsp(
     }
     report.lightmaps = lightmap_stats;
 
-    let (batches, stats) = geometry::build(&bsp, &lightmaps);
+    let (batches, stats, sky_3d) = geometry::build(&bsp, &lightmaps);
     info!(
         "built {} batches, {} triangles from {} faces in {:?}",
         batches.len(),
@@ -178,6 +184,14 @@ fn load_bsp(
     report.brush_entities = by_class.into_iter().collect();
     report.brush_entities.sort_by_key(|e| std::cmp::Reverse(e.1));
 
+    if let Some(s) = &sky_3d {
+        info!(
+            "3d skybox: {} faces, {} tris, origin {:?} scale {}",
+            s.faces, s.triangles, s.origin, s.scale
+        );
+    } else {
+        info!("map has no 3d skybox");
+    }
     report.stats = stats;
     report.batches = batches.len();
     report.largest = batches
@@ -193,6 +207,36 @@ fn load_bsp(
             Visibility::default(),
         ))
         .id();
+
+    // The 3D skybox gets its own root under the same yaw, carrying the one
+    // transform that puts it where it belongs: `(p - sky_origin) * scale`.
+    //
+    // Doing it here rather than per-vertex works because `to_bevy` is linear --
+    // a permutation and a uniform scale -- so the mapping commutes with it, and
+    // Bevy applies scale before translation. Hence scale `s`, translation
+    // `-to_bevy(origin) * s`.
+    //
+    // This is the cheap half of the choice. Source composites the skybox with a
+    // second camera at `sky_origin + (player - world_origin) / scale`, which
+    // parallaxes correctly; a fixed transform cannot, so the scenery is right
+    // standing still and slides wrongly as you move. For a viewer that is the
+    // better trade, but it *is* a lie -- see the roadmap.
+    let sky_root = sky_3d.as_ref().map(|s| {
+        let offset = geometry::to_bevy(s.origin) * s.scale;
+        commands
+            .spawn((
+                BspGeometry,
+                SkyBoxRoot,
+                ChildOf(root),
+                Transform {
+                    scale: Vec3::splat(s.scale),
+                    translation: -offset,
+                    ..default()
+                },
+                Visibility::default(),
+            ))
+            .id()
+    });
 
     // The map's own pakfile goes at the front of the search path, ahead of the
     // install -- that is how a custom map overrides stock content.
@@ -226,8 +270,13 @@ fn load_bsp(
             ..default()
         });
         let textured = materials.add(textured);
+        let parent = if batch.is_sky {
+            sky_root.unwrap_or(root)
+        } else {
+            root
+        };
         let mut entity = commands.spawn((
-            ChildOf(root),
+            ChildOf(parent),
             BspGeometry,
             Mesh3d(meshes.add(batch.mesh)),
             MeshMaterial3d(textured.clone()),
