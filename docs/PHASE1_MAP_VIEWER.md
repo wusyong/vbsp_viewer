@@ -369,13 +369,45 @@ Shader census across all maps, which sets M8's priorities: **43 772 `Lightmapped
 
 ### M7 — VTF decode
 
-- Header: `VTF\0`, `version: [u32; 2]`, `header_size`, `width: u16`, `height: u16`, `flags: u32`, `frames: u16`, `first_frame: u16`, pad, `reflectivity: [f32;3]`, pad, `bump_scale: f32`, `image_format: i32`, `mip_count: u8`, `low_res_format: i32`, `low_res_w: u8`, `low_res_h: u8`; 7.2+ adds `depth: u16`; 7.3+ adds `num_resources: u32` and a resource directory — locate the high-res image data via tag `[0x30, 0, 0]`. Always seek by `header_size`, never by a computed struct size.
+- Header: `VTF\0`, `version: [u32; 2]`, `header_size`, `width: u16`, `height: u16`, `flags: u32`, `frames: u16`, `first_frame: u16`, pad, `reflectivity: [f32;3]`, pad, `bump_scale: f32`, `image_format: i32`, `mip_count: u8`, `low_res_format: i32`, `low_res_w: u8`, `low_res_h: u8`; 7.2+ adds `depth: u16`; 7.3+ adds `num_resources: u32` and a resource directory — locate the high-res image data via tag `[0x30, 0, 0]`. ~~Always seek by `header_size`~~ — that finds the *low-res* image, not the high-res one; see M7 findings. Never use a computed struct size either.
 - **Mips are stored smallest-first**; within a mip, iterate frames → faces → slices.
 - Formats to support (indices from [imageformat.h:33](../../source-sdk-2013/src/public/bitmap/imageformat.h#L33)): `DXT1`, `DXT1_ONEBITALPHA`, `DXT3`, `DXT5`, `BGR888`, `BGRA8888`, `BGRX8888`, `RGBA8888`, `I8`, `IA88`, `A8`, `UV88`, `RGBA16161616F`.
 - **Prefer BCn passthrough:** hand DXT1/3/5 blocks straight to wgpu as `Bc1RgbaUnormSrgb` / `Bc2` / `Bc3RgbaUnormSrgb` via Bevy's `Image` — no CPU decode, and it keeps VRAM at parity with the real game. Keep `texpresso` behind a feature flag as a CPU fallback for backends without BC support. CPU-convert only the uncompressed formats.
 - Respect the `TEXTUREFLAGS_SRGB`-adjacent conventions: albedo → sRGB view, normal maps (`UV88`, `$bumpmap`) → linear.
 
 **Verify:** `cargo run -p vtf --example vtf2png -- materials/concrete/concretewall001.vtf` and eyeball the output against the in-game texture.
+
+### M7 findings
+
+VTF decode is in, and it reads every texture the game ships. TF2's rocky ground and the resupply-locker sign both come out pixel-correct (`vtfdump --bmp`), and the header's own `reflectivity` field cross-checks the decode: `nature/rockground008` declares `[0.327, 0.133, 0.068]` and decodes to a mean of `[153, 101, 74]` — the same red-dominant ratio.
+
+**⚠️ `headerSize` does not locate the image data.** The plan's "always seek by `header_size`, never by a computed struct size" is right about not trusting a struct size, but it is not how you find the pixels: **the high-res offset equals `headerSize` in 32 of 34 061 shipped VTFs and differs in 28 131**, because the low-res preview image sits in between. Two paths are needed:
+
+- **7.3+** — read the resource dictionary and take the entry tagged `0x30, 0, 0`.
+- **7.0–7.2** — no dictionary exists, so the image follows the preview at `headerSize + low_res_bytes`. This is **5 891 of the shipped files**, not a rare legacy case.
+
+Two traps inside the dictionary itself: it starts at **0x50, not at the end of the header struct (0x48)** — the padding the SDK flags in its own `!!!!CRITICAL!!!!` comment ([vtf.h:446](../../source-sdk-2013/src/public/vtf/vtf.h#L446)) — and an entry with `RSRCF_HAS_NO_DATA_CHUNK` set stores its *value* in the offset word. The `CRC` entry is on 27 900 files; read as an offset it points into space.
+
+**Cubemaps have 7 faces, not 6, and I measured it rather than trusting folklore.** [vtf.h:143](../../source-sdk-2013/src/public/vtf/vtf.h#L143) says "Cubemaps have *7* faces; the 7th is the fallback spheremap", but the version at which that changed is exactly the sort of claim that is wrong on the internet. So: compute the total image size for each candidate face count and see which matches the bytes present. The verdict is unanimous per version — **7 faces for 7.1 through 7.4** (48 files), **6 for 7.0** (2 files). TF2 ships no 7.5 envmap, so that case follows the documented change and is untested here, and the code says so.
+
+**My own format census was incomplete, and the plan was right.** Scanning the VPKs found no `DXT3`, `I8`, `IA88` or `A8` — all four of which the plan asked for — so it was tempting to drop them. Sweeping what the *maps* reference, with each pakfile mounted, turns up **12 `DXT3`, one `A8` and one `I8`**, packed inside maps. Implementing the formats the census called absent is what kept the map sweep at zero failures. (The census did find two the plan missed: `ABGR8888` and `RGB888_BLUESCREEN`.)
+
+**A visual dump can lie, so the dump reports numbers too.** `cubemap_gold001.hdr.vtf` rendered as flat mid-grey and looked like a plausible placeholder — because its alpha is 0 and the dump composited onto grey. The channel statistics say `red 88, green 74, blue 6`: a strong gold, decoded correctly all along. `vtfdump` now prints per-channel min/max/mean and composites onto a checkerboard, so a transparent surface reads as transparent.
+
+Smaller things that would each have been a silent wrong texture:
+
+- **A `0x0` low-res image costs 0 bytes, not one block.** Rounding it up to a block put the image offset 8 bytes high on 12 files, which is how this was found.
+- **Mips are stored smallest-first**, so mip 0 is at the *end* of the block; the fixture fills each level with its own index so a chain walked from the wrong end fails a test.
+- **`numMipLevels == 0` means one level**, not none.
+- **DXT1's punch-through mode applies only to standalone DXT1.** As the colour half of DXT3/DXT5 the four-colour interpolation is always used, because alpha comes from the other half. Getting this backwards makes every DXT5 texture with a dark gradient develop transparent holes.
+- A block wider than its surface must be clipped: a 2x2 mip still stores a full 4x4 block.
+
+**Acceptance gate passed, twice:**
+
+- **34 061 / 34 061 textures** in the shipped VPKs parsed and **every mip decoded** — 0 header errors, 0 decode errors, 0 short image blocks, 62 GiB of RGBA8. Covers all six header versions (7.0 through 7.5) and all ten formats present.
+- **39 438 / 39 438 textures across all 233 maps** with pakfiles mounted, **0 failures**, 123 GiB of RGBA8. Pakfile textures skew to 7.3 (23 860) where the VPKs skew to 7.4, so both header paths get real coverage.
+
+`vtf` stays engine-free: it exposes `ImageFormat`, `is_block_compressed()`, raw `surface()` bytes and the sampler hints (`is_normal_map`, `clamp_s`, `clamp_t`, `has_alpha`). Mapping those onto wgpu texture formats — the BCn passthrough the plan calls for — is M8's job, in `bevy_bsp`.
 
 ### M8 — Material assembly and final render
 
@@ -419,6 +451,8 @@ cargo test --workspace                  # struct sizes, KV/VMT/VPK unit tests
 cargo run -p bsp --example lumpdump -- --all-maps "<tf dir>"   # all 233 maps, 0 errors
 cargo run -p bsp --example lmdump   -- --all-maps "<tf dir>"   # lightmap atlas for every map
 cargo run -p vfs --example vfsls    -- --all-maps               # resolve every map's materials
+cargo run -p vtf --example vtfdump  -- --all-textures           # decode every VTF in the game
+cargo run -p vtf --example vtfdump  -- --all-maps               # ...and every VTF the maps use
 ```
 The all-maps sweep is the highest-value test in phase 1 — it catches version drift, `dleaf_t` v0/v1 branching, unusual displacement powers, and community-map edge cases in one command.
 

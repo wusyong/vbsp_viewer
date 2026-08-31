@@ -1,0 +1,13 @@
+[package]
+name = "vtf"
+version = "0.1.0"
+edition = "2024"
+description = "Reader for Valve Texture Format (VTF) images"
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bsp = { path = "../bsp" }
+vfs = { path = "../vfs" }
