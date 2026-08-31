@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bsp",
+    "crates/vfs",
     "crates/bevy_bsp",
 ]
 
@@ -30,3 +31,4 @@ bevy.workspace = true
 clap.workspace = true
 bsp = { path = "crates/bsp" }
 bevy_bsp = { path = "crates/bevy_bsp" }
+vfs = { path = "crates/vfs" }

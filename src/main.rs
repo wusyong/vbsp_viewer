@@ -385,19 +385,41 @@ fn load_map(
         }
     };
 
-    // Pack the bake, then rewrite UV_1 in place. Both builders record their
-    // source face per chunk, so brush and terrain surfaces go through the same
-    // atlas — a displacement's lighting lives on its parent face.
+    // Brush entities: doors, gates, and the func_brush detail that makes up a
+    // lot of a TF2 map. Each is a BSP model placed at the entity's origin, and
+    // finding them needs the ENTITIES lump's KeyValues — which is why this
+    // waited for the `vfs` crate rather than shipping with M2.
+    let mut brush_models = match brush_entity_models(&bsp) {
+        Ok(models) => models,
+        Err(e) => {
+            // Worth continuing without: the world still renders, and missing
+            // doors is a far smaller problem than no map at all.
+            error!("failed to build brush entities: {e}");
+            Vec::new()
+        }
+    };
+
+    // Pack the bake, then rewrite UV_1 in place. Every builder records its
+    // source face per chunk, so world, terrain and brush entities go through
+    // the same atlas — a displacement's lighting lives on its parent face.
     let atlas = if args.no_lightmap {
         None
     } else {
         let faces: Vec<u32> = bsp::lightmap::faces_of(&world.surfaces)
             .chain(bsp::lightmap::faces_of(&displacements.surfaces))
+            .chain(
+                brush_models
+                    .iter()
+                    .flat_map(|entity| bsp::lightmap::faces_of(&entity.geometry.surfaces)),
+            )
             .collect();
         match bsp::lightmap::build(&bsp, faces, bsp::lightmap::Lighting::Ldr) {
             Ok(atlas) => {
                 atlas.remap(&mut world.surfaces);
                 atlas.remap(&mut displacements.surfaces);
+                for entity in &mut brush_models {
+                    atlas.remap(&mut entity.geometry.surfaces);
+                }
                 Some(atlas)
             }
             Err(e) => {
@@ -436,6 +458,19 @@ fn load_map(
         &displacements,
         surfaces,
     );
+    let mut entity_draw_calls = 0usize;
+    for entity in &brush_models {
+        entity_draw_calls += bevy_bsp::spawn_model(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &entity.geometry,
+            surfaces,
+            entity.origin,
+            &entity.name,
+        );
+    }
+
     *info = bevy_bsp::map_info(
         &map_name,
         bsp.version(),
@@ -443,6 +478,11 @@ fn load_map(
         &displacements,
         atlas.as_ref(),
     );
+    info.brush_entities = brush_models.len();
+    info.brush_entity_triangles = brush_models
+        .iter()
+        .map(|e| e.geometry.triangle_count())
+        .sum();
 
     let start = default_viewpoint(&world);
     if let Ok((mut transform, mut fly)) = camera.single_mut() {
@@ -455,15 +495,69 @@ fn load_map(
     }
 
     info!(
-        "{map_name}: {} materials, {} verts, {} tris ({draw_calls} draw calls); \n         {} disps, {} verts, {} tris ({disp_draw_calls} draw calls); {:.0} ms",
+        "{map_name}: {} materials, {} verts, {} tris ({draw_calls} draw calls); \n         {} disps, {} verts, {} tris ({disp_draw_calls} draw calls); \n         {} brush entities, {} tris ({entity_draw_calls} draw calls); {:.0} ms",
         info.materials,
         info.vertices,
         info.triangles,
         info.displacements_built,
         info.displacement_vertices,
         info.displacement_triangles,
+        info.brush_entities,
+        info.brush_entity_triangles,
         started.elapsed().as_secs_f32() * 1000.0,
     );
+}
+
+/// One brush entity, ready to spawn.
+struct BrushEntity {
+    geometry: ModelGeometry,
+    /// Source units; the entity's `origin` key.
+    origin: [f32; 3],
+    /// `classname` and `targetname`, for the entity's `Name` in the scene.
+    name: String,
+}
+
+/// Build the geometry of every entity that draws a BSP model.
+///
+/// Model 0 is worldspawn and is excluded by `vfs::entities::brush_entities`.
+/// A model index the MODELS lump does not have is skipped rather than failing
+/// the map — one broken entity should not cost the whole level.
+fn brush_entity_models(bsp: &bsp::Bsp) -> Result<Vec<BrushEntity>, Box<dyn std::error::Error>> {
+    let entities = vfs::entities::parse(bsp.entities_str()?)?;
+    let model_count = bsp.models()?.len();
+
+    let mut out = Vec::new();
+    for (model, entity) in vfs::entities::brush_entities(&entities) {
+        if model >= model_count {
+            warn!(
+                "{} references model *{model}, but the map has {model_count}",
+                entity.classname
+            );
+            continue;
+        }
+        let geometry = match bsp::geometry::build_model(bsp, model) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("{}: model *{model} failed to build: {e}", entity.classname);
+                continue;
+            }
+        };
+        // An entity with no visible faces — a trigger volume, a clip brush —
+        // would spawn nothing but still cost an entity and a HUD line.
+        if geometry.surfaces.is_empty() {
+            continue;
+        }
+        let name = match entity.targetname() {
+            Some(target) => format!("{}[{target}]", entity.classname),
+            None => format!("{}*{model}", entity.classname),
+        };
+        out.push(BrushEntity {
+            geometry,
+            origin: entity.origin(),
+            name,
+        });
+    }
+    Ok(out)
 }
 
 /// Where the camera starts when `--pos`/`--angles` are not given.
@@ -767,6 +861,7 @@ fn update_hud(
         "{} (bsp v{})\n\
          {} materials  {} verts  {} tris  {} draw calls\n\
          terrain {} disps  {} verts  {} tris\n\
+         brush entities {}  {} tris\n\
          faces {}/{}  ({} on displacements)\n\
          lightmap {}\n\
          pos {x:.0} {y:.0} {z:.0} (Source units)\n\
@@ -783,6 +878,8 @@ fn update_hud(
         info.displacements_built,
         info.displacement_vertices,
         info.displacement_triangles,
+        info.brush_entities,
+        info.brush_entity_triangles,
         info.faces_built,
         info.faces_total,
         info.displacement_faces,

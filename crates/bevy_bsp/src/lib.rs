@@ -171,6 +171,9 @@ pub struct MapInfo {
     pub lightmap_occupancy: f32,
     /// Brightest luxel channel in the map, in linear light.
     pub lightmap_peak: f32,
+    /// Brush entities drawn — doors, gates, func_brush detail.
+    pub brush_entities: usize,
+    pub brush_entity_triangles: usize,
 }
 
 /// Build a Bevy mesh from one material's worth of BSP geometry.
@@ -406,6 +409,10 @@ pub fn map_info(
         lightmap_unlit: atlas.map_or(0, |a| a.stats.faces_unlit),
         lightmap_occupancy: atlas.map_or(0.0, |a| a.stats.occupancy(a.pixel_count())),
         lightmap_peak: atlas.map_or(0.0, |a| a.stats.peak),
+        // Filled in by the caller: brush entities are placed from the ENTITIES
+        // lump, which this crate does not read.
+        brush_entities: 0,
+        brush_entity_triangles: 0,
     }
 }
 

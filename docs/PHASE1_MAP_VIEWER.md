@@ -319,10 +319,53 @@ Lighting in. `cp_badlands` packs 12 978 faces into a **2048 × 865** atlas at 89
 
   Sound/VO VPKs are irrelevant to phase 1 — skip them. Config via `--game-dir` / `BEVY_TF2_GAME_DIR`, defaulting to the detected Steam path.
 - **VPK v2 reader:** header `{ signature: u32 = 0x55aa1234, version: u32 = 2, tree_size: u32 }` then `{ file_data_section_size, archive_md5_section_size, other_md5_section_size, signature_section_size }: u32`. Directory tree is a three-level nesting of NUL-terminated strings (extension → path → filename, each level ended by an empty string); each leaf carries `{ crc: u32, preload_bytes: u16, archive_index: u16, entry_offset: u32, entry_length: u32 }` followed by `preload_bytes` of inline data. `archive_index == 0x7fff` means the payload lives in the `_dir` file itself, after the tree; otherwise it's in `tf2_textures_<NNN>.vpk`. A file can be preload-only, archive-only, or both concatenated. Build a `HashMap<String, VpkEntry>` with lowercased, `/`-normalised paths.
-- **Pakfile zip:** use the `zip` crate over a `Cursor` on the decompressed lump.
+- **Pakfile zip:** ~~use the `zip` crate over a `Cursor` on the decompressed lump~~ — hand-written instead; every compressed entry is LZMA (method 14) and the crate mis-decodes them. See M6 findings.
 - **VMT parse:** shader name (`LightmappedGeneric`, `WorldVertexTransition`, `UnlitGeneric`, `Water`, `SkyBox`), `$basetexture`, `$basetexture2`, `$translucent`, `$alphatest`, `$nocull`, `$surfaceprop`. Implement `Patch { include, replace }` inheritance — TF2 uses it heavily.
 
 **Verify:** `cargo run -p vfs --example vfsls -- materials/concrete/` lists entries and their source path. Unit test resolving a handful of known VMTs and dumping keys. Cross-check a few resolutions against what the real game loads.
+
+### M6 findings
+
+The VFS is in, and with it the KeyValues parser that three later things depend on. `vfsls --mounts` produces exactly the stack the plan predicted, plus the sound VPKs gameinfo really does list ahead of `tf2_misc`, in 130 ms:
+
+```
+ 1. tf/custom/workshop          7. hl2/hl2_sound_vo_english_dir.vpk
+ 2. tf/tf2_textures_dir.vpk     8. hl2/hl2_sound_misc_dir.vpk
+ 3. tf/tf2_sound_vo_english...  9. hl2/hl2_misc_dir.vpk
+ 4. tf/tf2_sound_misc_dir.vpk  10. tf/            (loose)
+ 5. tf/tf2_misc_dir.vpk        11. hl2/           (loose)
+ 6. hl2/hl2_textures_dir.vpk   12. tf/download    (loose)
+```
+
+**⚠️ The biggest find: every compressed entry in a TF2 map pakfile is LZMA, and the `zip` crate cannot read them.** Measured across all 233 maps: **686 974 entries with method 14 (LZMA), 121 555 stored, and no deflate at all** — so the plan's `zip = { features = ["deflate"] }` would have failed on every single map. Adding `"lzma"` still fails:
+
+```
+LzmaError("LZ distance 1537 is beyond output size 127")
+```
+
+because that decoder tries to infer the output length instead of using the one the zip header states. A raw LZMA1 stream carries no length and usually no end-of-stream marker, so it *cannot* be decoded without being told — the same fact M1 established for compressed lumps. Synthesising the 13-byte "alone" header (`props ++ size as u64 LE`) turns those exact bytes into valid material text. So `pakfile.rs` is hand-written: ~200 lines reading the central directory, store and LZMA only, erroring by name on anything else. That **removes** the `zip` dependency rather than adding it.
+
+**Three gameinfo details each silently mount nothing if you get them wrong.**
+
+- **Locations are relative to the install root, not to the directory holding `gameinfo.txt`** — which is why the entries read `tf/tf2_textures.vpk` even though the file itself lives in `tf/`. Anchoring at the game dir produces `tf/tf/...` and an empty VFS. A test asserts no resolved path contains `/tf/tf/`.
+- **`game_lv` is not `game`.** Type matching has to be exact per `+`-separated token, or a normal install mounts `tf2_lv.vpk` — the low-violence asset override — above the real textures. (It is absent on this install, which is also why a missing search path must be a silent skip, not an error.)
+- A `.vpk` reference names the *set*: `tf2_textures.vpk` means `tf2_textures_dir.vpk`. And inside `custom/*`, a `_NNN.vpk` is the *payload* of a set, not its own archive — mounting one fails the VPK header check.
+
+**The VPK record has a `0xffff` terminator the plan's field list omitted.** Per-file records are 18 bytes, not 16: `crc, preload_bytes, archive_index, entry_offset, entry_length, terminator`. Every other field is self-describing, so leaving it out desynchronises the tree from the second file onward and yields plausible garbage. It is verified on every entry.
+
+Also: a file's bytes can be **split** between the tree's inline preload and an archive body, so `read` concatenates both; a reader that assumes one or the other truncates. And Valve writes a single space, not an empty string, where a name component is empty (a file at the archive root, or with no extension).
+
+**Brush entities are in, closing the gap deferred from M2.** The ENTITIES lump is KeyValues, so it belongs in `vfs`, not `bsp` — `bsp` hands over the lump text and stays free of any text format. `cp_badlands` gains **102 brush entities, 352 triangles**: the doors, gates and `func_brush` detail that were previously holes. Two details matter: a `model` of `*N` is a brush model while a `.mdl` is a static prop (phase 2), and **model 0 must be excluded** — a `func_brush` pointing at it would draw the entire world a second time, z-fighting with itself. Their faces go through the same lightmap atlas as everything else, which is visible as the atlas growing from 12 978 to 13 154 packed faces.
+
+**Acceptance gate passed:** all **233 maps, 0 failures** — **255 272 entities parsed** with no lump errors, 30 068 of them brush entities; **47 694 material references**, 13 011 resolved through a `Patch` chain, 17 314 served from a map's own pakfile; **0 broken `.vmt`**.
+
+20 material references (0.04%, across 16 community maps) name a `.vmt` that is **not in the game at all** — verified by hand: `materials/lights/white001.vmt` and `white001_nochop.vmt` exist, but `2koth_abbey`'s `white001_nolight.vmt` does not, and was never packed. The real engine draws those as the missing-material checkerboard, so the gate reports them separately and fails only on a material that is *present but unreadable*, or on a map where nothing resolves. Every Valve-shipped map resolves 100%.
+
+Shader census across all maps, which sets M8's priorities: **43 772 `LightmappedGeneric`**, 2 073 `WorldVertexTransition`, 1 169 `UnlitGeneric`, 547 `Water`, then a long tail (42 `UnlitTwoTexture`, 33 `DecalModulate`, 13 `VertexLitGeneric`, 13 `WindowImposter`, 8 `Modulate`, 4 `Refract`). Two shaders cover 96%.
+
+- Shipped materials spell the same shader `LightmappedGeneric` and `LightMappedGeneric`, and keys `$basetexture` / `$BaseTexture`, so every lookup is case-insensitive.
+- Keys repeat legitimately (`[$LDR]`/`[$HDR]` pairs, gameinfo's `hidden_maps`), so `KeyValues` is an ordered list and `get` returns the first — matching Valve's own reader.
+- A bare `[$WIN32]` token is a condition on the preceding pair, not a value; phase 1 keeps the value and drops the condition.
 
 ### M7 — VTF decode
 
@@ -356,7 +399,8 @@ bevy      = "0.19"
 bytemuck  = { version = "1", features = ["derive"] }
 memmap2   = "0.9"
 lzma-rs   = "0.3"     # BSP lump decompression — mandatory, see M1
-zip       = { version = "2", default-features = false, features = ["deflate"] }
+# zip  -- dropped: TF2 pakfiles are LZMA-only and the crate cannot read them.
+#         See M6 findings; crates/vfs/src/pakfile.rs reads them directly.
 thiserror = "2"
 clap      = { version = "4", features = ["derive"] }
 image     = "0.25"    # examples/vtf2png only
@@ -374,6 +418,7 @@ Available and confirmed on crates.io. The published `vbsp` 0.9.1 / `vtf` 0.4.1 /
 cargo test --workspace                  # struct sizes, KV/VMT/VPK unit tests
 cargo run -p bsp --example lumpdump -- --all-maps "<tf dir>"   # all 233 maps, 0 errors
 cargo run -p bsp --example lmdump   -- --all-maps "<tf dir>"   # lightmap atlas for every map
+cargo run -p vfs --example vfsls    -- --all-maps               # resolve every map's materials
 ```
 The all-maps sweep is the highest-value test in phase 1 — it catches version drift, `dleaf_t` v0/v1 branching, unusual displacement powers, and community-map edge cases in one command.
 

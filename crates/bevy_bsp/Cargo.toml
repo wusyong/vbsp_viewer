@@ -8,3 +8,4 @@ description = "Bevy integration for Source engine BSP maps"
 bevy.workspace = true
 half.workspace = true
 bsp = { path = "../bsp" }
+vfs = { path = "../vfs" }

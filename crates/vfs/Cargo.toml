@@ -1,0 +1,13 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2024"
+description = "Source engine virtual file system: gameinfo search paths, VPK, pakfile, KeyValues, VMT"
+
+[dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+lzma-rs.workspace = true
+
+[dev-dependencies]
+bsp = { path = "../bsp" }
