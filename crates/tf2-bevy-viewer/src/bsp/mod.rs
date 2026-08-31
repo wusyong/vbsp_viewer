@@ -185,6 +185,26 @@ fn load_bsp(
     report.brush_entities = by_class.into_iter().collect();
     report.brush_entities.sort_by_key(|e| std::cmp::Reverse(e.1));
 
+    info!(
+        "normal mismatches: {} strong across {} distinct faces",
+        stats.normal_mismatches_strong,
+        stats.normal_mismatch_faces.len()
+    );
+    {
+        // Group by texture: if the 45 cluster on a few materials, that points at
+        // the map's authoring rather than at our winding rule.
+        let mut by_texture: std::collections::BTreeMap<String, usize> = default();
+        for id in &stats.normal_mismatch_faces {
+            if let Some(face) = bsp.face(*id as usize) {
+                *by_texture
+                    .entry(face.texture().name().to_ascii_lowercase())
+                    .or_default() += 1;
+            }
+        }
+        if !by_texture.is_empty() {
+            warn!("  mismatches by texture: {by_texture:?}");
+        }
+    }
     if let Some(s) = &sky_3d {
         info!(
             "3d skybox: {} faces, {} tris, origin {:?} scale {}",

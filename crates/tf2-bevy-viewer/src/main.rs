@@ -497,12 +497,13 @@ fn report(
         None => out.push_str("sky: none\n"),
     }
     out.push_str(&format!(
-        "{} models used, {} orphaned · side set on {} · mismatches {} ({} strong)\n",
+        "{} models used, {} orphaned · side set on {} · mismatches {} ({} strong, {} displaced)\n",
         s.models_used,
         s.models_orphaned,
         s.faces_side_set,
         s.normal_mismatches,
         s.normal_mismatches_strong,
+        s.normal_mismatches_displaced,
     ));
     for (name, tris) in &bsp_report.largest {
         out.push_str(&format!("    {tris:>7} tris  {name}\n"));

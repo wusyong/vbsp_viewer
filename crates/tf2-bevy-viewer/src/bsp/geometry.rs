@@ -224,7 +224,7 @@ pub struct Batch {
     pub is_sky: bool,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct Stats {
     /// Brush models reachable from worldspawn plus the entity lump.
     pub models_used: usize,
@@ -245,12 +245,19 @@ pub struct Stats {
     pub triangles: usize,
     pub vertices: usize,
     /// Faces whose plane normal disagrees with the normal implied by their
-    /// winding. Should be zero; if it isn't, the normal rule, the fan order or
-    /// the coordinate mapping is wrong. On ctf_2fort this sits at 49 of 14879.
+    /// winding. Should be zero, and since 1.6a it is: 0 of 14,787 on ctf_2fort.
+    /// The 49 this used to report was the check reading a single triangle of the
+    /// fan rather than the whole face.
     pub normal_mismatches: usize,
     /// Of those, the ones that are unambiguously backwards rather than just
     /// numerically noisy. This is the number that must be zero.
     pub normal_mismatches_strong: usize,
+    /// Of the strong ones, how many are displacements. Until 1.6a the check
+    /// never ran on those at all.
+    pub normal_mismatches_displaced: usize,
+    /// Distinct faces behind `normal_mismatches_strong`. If this is lower, the
+    /// same face is being visited by more than one placement.
+    pub normal_mismatch_faces: std::collections::BTreeSet<u32>,
     /// How many faces set `side`. Informational, and a standing reminder of why
     /// it must be ignored: see `push_face`.
     pub faces_side_set: usize,
@@ -332,7 +339,7 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats, Option<Sky
                 stats.faces_lit += 1;
             }
             let before = accum.indices.len();
-            push_face(accum, &face, &texture, placement.origin, patch, &mut stats);
+            push_face(accum, face_id, &face, &texture, placement.origin, patch, &mut stats);
             if in_sky && let Some(s) = sky.as_mut() {
                 s.faces += 1;
                 s.triangles += (accum.indices.len() - before) / 3;
@@ -379,6 +386,7 @@ pub fn build(bsp: &Bsp, lightmaps: &Lightmaps) -> (Vec<Batch>, Stats, Option<Sky
 /// one path now, and it is indexed rather than a soup.
 fn push_face(
     accum: &mut Accum,
+    face_id: u32,
     face: &Handle<Face>,
     texture: &Handle<TextureInfo>,
     origin: Vec3,
@@ -451,16 +459,10 @@ fn push_face(
         .indices
         .extend(face.triangulate_indices().map(|i| base + i as u32));
 
-    // Taking the normal from the face's plane is exact and free; vbspview
-    // recomputes normals from the triangles instead, which costs a pass and
-    // loses nothing here.
-    //
-    // Do NOT negate this when `dface_t.side` is set, however tempting the field
-    // name is. `side` records which side of the plane the face sits on for the
-    // BSP tree's benefit; the surfedge walk is already wound to the face's true
-    // facing, so the plane normal needs no correction. Measured on ctf_2fort:
-    // flipping on `side` disagreed with the winding on 5508 of 14879 faces,
-    // leaving it alone disagreed on 49.
+    // The plane normal is exact and free. Do NOT negate it when `dface_t.side`
+    // is set: `side` says which side of the plane the face sits on for the BSP
+    // tree, and the surfedge walk is already wound to the face's true facing.
+    // Flipping on it mismatches 5,788 of 14,787 faces; leaving it alone, zero.
     let plane_normal = dir_to_bevy(face.normal()).normalize_or_zero();
     if face.side != 0 {
         stats.faces_side_set += 1;
@@ -488,26 +490,48 @@ fn push_face(
         for i in first..accum.positions.len() {
             accum.normals[i] = Vec3::from(accum.normals[i]).normalize_or_zero().to_array();
         }
-        return;
+    } else {
+        accum
+            .normals
+            .resize(accum.positions.len(), plane_normal.to_array());
     }
 
-    accum
-        .normals
-        .resize(accum.positions.len(), plane_normal.to_array());
-
-    // Cross-check the plane normal against the winding of the first emitted
-    // triangle. This is the cheapest way to catch a wrong coordinate mapping, a
-    // wrong fan order or a wrong normal rule, and it is what caught the `side`
-    // mistake above.
-    let Some(tri) = accum.indices.get(index_start..index_start + 3) else {
-        return;
+    // Cross-check: does the winding agree with the plane normal? Catches a wrong
+    // coordinate mapping, fan order or normal rule, and it caught the `side`
+    // mistake above. Not just a diagnostic -- backfaces are culled unless the VMT
+    // says `$nocull`, so a backwards face is invisible, a hole you see through.
+    //
+    // Sum over *every* triangle, not the first. One triangle at a concave corner
+    // can wind against the face as a whole; area-weighting (Newell's method)
+    // ignores slivers. Reading only the first reported 45 faces that were fine.
+    //
+    // Displacements measure the *undisplaced* grid: the plane belongs to the flat
+    // base quad, so a displaced triangle reports the terrain's slope, not winding.
+    let winding = if displaced {
+        face.displacement().map(|disp| {
+            let base: Vec<Vec3> = disp.raw_vertices().map(|(_, base)| base).collect();
+            let mut sum = Vec3::ZERO;
+            for tri in disp.triangulated_indices().collect::<Vec<_>>().as_chunks::<3>().0 {
+                let [i, j, k] = [tri[0], tri[1], tri[2]];
+                sum += (base[j] - base[i]).cross(base[k] - base[i]);
+            }
+            dir_to_bevy(sum)
+        })
+    } else {
+        let mut sum = Vec3::ZERO;
+        for tri in accum.indices[index_start..].as_chunks::<3>().0 {
+            let [a, b, c] = [
+                Vec3::from(accum.positions[tri[0] as usize]),
+                Vec3::from(accum.positions[tri[1] as usize]),
+                Vec3::from(accum.positions[tri[2] as usize]),
+            ];
+            sum += (b - a).cross(c - a);
+        }
+        Some(sum)
     };
-    let [a, b, c] = [
-        Vec3::from(accum.positions[tri[0] as usize]),
-        Vec3::from(accum.positions[tri[1] as usize]),
-        Vec3::from(accum.positions[tri[2] as usize]),
-    ];
-    let agreement = (b - a).cross(c - a).normalize_or_zero().dot(plane_normal);
+    let Some(winding) = winding else { return };
+
+    let agreement = winding.normalize_or_zero().dot(plane_normal);
     if agreement < 0.0 {
         stats.normal_mismatches += 1;
         // Split the residual: a genuinely backwards face reads about -1, while a
@@ -515,6 +539,10 @@ fn push_face(
         // means nothing.
         if agreement < -0.5 {
             stats.normal_mismatches_strong += 1;
+            stats.normal_mismatch_faces.insert(face_id);
+            if displaced {
+                stats.normal_mismatches_displaced += 1;
+            }
         }
     }
 }
