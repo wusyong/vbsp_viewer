@@ -2,9 +2,12 @@
 resolver = "3"
 members = [
     "crates/bsp",
+    "crates/bevy_bsp",
 ]
 
 [workspace.dependencies]
+bevy      = "0.19.1"
+clap      = { version = "4", features = ["derive"] }
 bytemuck  = { version = "1", features = ["derive"] }
 memmap2   = "0.9"
 lzma-rs   = "0.3"
@@ -22,3 +25,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bevy.workspace = true
+clap.workspace = true
+bsp = { path = "crates/bsp" }
+bevy_bsp = { path = "crates/bevy_bsp" }

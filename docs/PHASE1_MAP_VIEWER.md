@@ -180,6 +180,28 @@ Implemented in `crates/bsp`. Confirmed against real data:
 
 **Verify:** fly around a flat-shaded Badlands.
 
+### M3 findings
+
+Running at **86–91 fps on Badlands, 88 draw calls**, map load 57 ms. Verified by screenshot, not just by "it launched".
+
+**Bevy 0.19 API differs from the plan's assumptions** in several places — all found by reading the fetched crate source rather than by guessing:
+
+| Plan assumed | Bevy 0.19 actually |
+|---|---|
+| `AmbientLight` resource | `AmbientLight` is a per-camera **Component**; scene-wide is the `GlobalAmbientLight` **resource** |
+| `DirectionalLight.shadows_enabled` | `shadow_maps_enabled` (plus separate `contact_shadows_enabled`) |
+| `TextFont.font_size: f32` | `font_size: FontSize`, a unit-carrying enum (`FontSize::Px(13.0)`) |
+| `window.cursor_options` | `CursorOptions` is its own Component on the window entity |
+| `AccumulatedMouseMotion` in prelude | not in prelude — `bevy::input::mouse::AccumulatedMouseMotion` |
+| `PrimitiveTopology`/`Indices` from `bevy::render` | `bevy::mesh::*`; `RenderAssetUsages` from `bevy::asset` |
+
+- **Startup systems that talk to each other need `.chain()`, not a tuple.** `load_map` repositions the camera `setup_scene` spawns; as an unordered tuple its query silently found nothing and the view stayed at the origin. An ordering edge is what makes Bevy insert the sync point that flushes the spawn command. This failed *silently* — the map still rendered, just from the wrong place.
+- **Deviation from the plan: no `AssetLoader`.** The map is memory-mapped, lives outside the asset directory, and builds in 57 ms. A custom `AssetSource` to reach the Steam folder is real complexity for no phase-1 benefit. Worth revisiting for hot-reload once more than one map is in play.
+- **Added `--screenshot`, `--pos` and `--angles`** beyond the plan. `--pos` takes Source units so a shot can be framed to match `cl_showpos` in the real game, which is exactly what M4's silhouette check, M5's lighting check and M8's side-by-side need. `allow_hyphen_values` is required or clap reads a negative coordinate as a flag.
+- **Default map is `ctf_2fort`**; `--map` takes a name or a path.
+- **Auto-framing the camera has two traps.** The MODELS-lump bounding box is unusable as a spawn point: it includes 3D-skybox and pit brushes, so `cp_badlands` spans 16 500 units vertically and its box centre sits thousands of units *below* the floor. But sampling a point *inside* the level fails too — `ctf_2fort`'s horizontal median is inside the central tower, so the view is a wall at any height. What works: percentile-trimmed bounds (2nd/98th), then stand back along a diagonal at `0.85 ×` the horizontal span and look at the centre. Verified to give a clean overview on both maps.
+- Debug palette: do **not** step an already-uniform hash by the golden ratio — that trick is for walking a *sequence*, and here it squeezed every hue into 0–222°. Take hue straight from the hash and jitter saturation/lightness from independent bits.
+
 ### M4 — Displacement surfaces
 
 Most TF2 maps put all ground and cliffs in displacements; Badlands has 1191 of them.

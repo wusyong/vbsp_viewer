@@ -1,0 +1,9 @@
+[package]
+name = "bevy_bsp"
+version = "0.1.0"
+edition = "2024"
+description = "Bevy integration for Source engine BSP maps"
+
+[dependencies]
+bevy.workspace = true
+bsp = { path = "../bsp" }
