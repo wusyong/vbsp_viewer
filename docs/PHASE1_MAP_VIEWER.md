@@ -159,7 +159,16 @@ Implemented in `crates/bsp`. Confirmed against real data:
   Compute in **Source space with unscaled coords**, before `src_to_bevy`.
 - **Also render brush entities.** Parse the ENTITIES lump (KeyValues text, reuse `vfs`'s KV lexer) and for each entity with `model "*N"`, emit `models[N]`'s faces translated by its `origin`. Without this, doors, gates and moving platforms are missing holes in the world.
 
-**Verify:** log vertex/triangle counts per map; batch-run all 233 maps with no panic and no degenerate (zero-area) triangles above a small threshold.
+**Verify:** `geomdump --all-maps` builds every model of every map. Fail on out-of-range edge indices, lump errors, or a worldspawn that yields no faces. ~~no degenerate triangles~~ — see M2 findings; zero-area triangles are normal.
+
+### M2 findings
+
+**Acceptance gate passed:** built every model of all **233 maps — 0 failures**, 16.7 M verts / 9.34 M tris total. **Zero faces with out-of-range edge indices and zero faces with fewer than 3 edges across every map**, which is the real signal that the signed-surfedge walk is right. Heaviest map is `cp_fulgur` (89 820 tris); most materials is `pl_embargo` (586).
+
+- **Zero-area fan triangles are expected map content, not a defect.** ~10% of fan triangles on `cp_badlands` come out *exactly* zero area. vbsp inserts extra vertices along straight edges to close t-junctions against neighbouring faces, so a face is frequently a triangle or quad carrying a long collinear run — one 21-vertex Badlands face is really a triangle with 18 collinear points on one edge. A fan from vertex 0 emits a zero-area triangle for every such pair, and **loses no surface area**, because those triangles lie on a line through the apex. The `|cross|` histogram is bimodal with a clean gap: 10.08% exactly `0`, then 0.01% below `1e-4`. Across all 233 maps this is 836 573 of 10.2 M fan triangles (8.2%). They are dropped (they render nothing and would give NaN tangents in M8) and counted, never treated as an error.
+- Badlands worldspawn: 88 materials, 62 787 verts, 35 154 tris from 11 812/13 483 faces — 1191 faces deferred to M4 as displacements, 480 skipped as tool surfaces. The three heaviest materials are all wooden structure (`WOOD/WOOD_BRIDGE001` at 6519 tris).
+- Grouping by texdata collapses 11 812 faces to **88 draw calls**, not the 151 the material count suggested — 63 of Badlands' materials are used only by displacements or tool brushes.
+- Brush entities (models 1..138) total only 704 verts / 352 tris, so deferring their placement to M6 costs almost nothing visually.
 
 ### M3 — Bevy app + free camera
 

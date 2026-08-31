@@ -16,6 +16,7 @@
 //! ```
 
 pub mod flags;
+pub mod geometry;
 pub mod lump;
 pub mod raw;
 
@@ -122,7 +123,8 @@ pub enum BspError {
     UnterminatedString { lump: &'static str, ofs: usize },
 }
 
-type Result<T> = std::result::Result<T, BspError>;
+/// Convenience alias used throughout the crate.
+pub type Result<T> = std::result::Result<T, BspError>;
 
 /// A byte buffer guaranteed to be 8-byte aligned, so lumps materialised on the
 /// heap can still be cast to `Pod` slices without a second copy.
