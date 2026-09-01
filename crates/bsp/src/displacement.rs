@@ -53,7 +53,7 @@
 
 use crate::flags;
 use crate::geometry::{self, FaceChunk, Surface, SurfaceSet, Vertex};
-use crate::raw::{DEdge, DFace, DVertex, DispVert};
+use crate::raw::{DEdge, DFace, DVertex, DispVert, TexInfo};
 use crate::{Bsp, Result};
 
 /// Counters for a displacement build.
@@ -472,6 +472,159 @@ pub fn build_displacements(bsp: &Bsp) -> Result<DispGeometry> {
     Ok(DispGeometry { surfaces, stats })
 }
 
+/// The luxel grid dimensions vbsp would derive for a displacement's parent
+/// face, recomputed from the rotated parent quad and the face's lightmap
+/// vectors.
+///
+/// Transcribed from `CCoreDispSurface::CalcLuxelCoords`
+/// (`public/builddisp.cpp:442`): the U extent is the longer of the two edges
+/// running corner 0 -> 3 and corner 1 -> 2, the V extent the longer of
+/// 0 -> 1 and 3 -> 2, each divided by the face's world-units-per-luxel and
+/// truncated, plus one, capped at `MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER`.
+///
+/// This exists to be compared against the `m_LightmapTextureSizeInLuxels` the
+/// compiler actually stored — see [`check_luxel_axes`]. `None` when the
+/// lightmap vectors are degenerate, which would make the scale meaningless.
+pub fn luxel_dims_from_edges(corners: &[[f32; 3]; 4], texinfo: &TexInfo) -> Option<[i32; 2]> {
+    // `nLuxelsPerWorldUnit` in Valve's source, but the reciprocal of its name:
+    // the vector's length is luxels per unit, so this is units per luxel.
+    //
+    // Guard the length *before* dividing: a zeroed lightmap vector gives
+    // infinity, and Rust's float-to-int cast saturates rather than trapping, so
+    // `<= 0` alone would let `i32::MAX` through and silently return a 1 x 1
+    // grid instead of admitting the scale is meaningless.
+    let luxels_per_unit = length(&texinfo.lightmap_vecs[0][..3]);
+    if !luxels_per_unit.is_finite() || luxels_per_unit <= 0.0 {
+        return None;
+    }
+    let units_per_luxel = (1.0 / luxels_per_unit) as i32;
+    if units_per_luxel <= 0 {
+        return None;
+    }
+    let scale = 1.0 / units_per_luxel as f32;
+
+    let u_length = distance(corners[3], corners[0]).max(distance(corners[2], corners[1]));
+    let v_length = distance(corners[1], corners[0]).max(distance(corners[2], corners[3]));
+
+    Some([
+        ((u_length * scale) as i32 + 1).min(MAX_DISP_LUXEL_DIM),
+        ((v_length * scale) as i32 + 1).min(MAX_DISP_LUXEL_DIM),
+    ])
+}
+
+/// `MAX_DISP_LIGHTMAP_DIM_WITHOUT_BORDER` (`bspfile.h:35`).
+const MAX_DISP_LUXEL_DIM: i32 = 125;
+
+fn length(v: &[f32]) -> f32 {
+    v.iter().map(|c| c * c).sum::<f32>().sqrt()
+}
+
+fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    length(&[a[0] - b[0], a[1] - b[1], a[2] - b[2]])
+}
+
+/// Result of [`check_luxel_axes`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LuxelAxisCheck {
+    /// Recomputed dimensions matched the stored ones in the order
+    /// [`corner_luxel_coords`] uses them.
+    pub agree: usize,
+    /// **Recomputed dimensions matched only when transposed.** Non-zero means
+    /// U and V are the wrong way round, or the corner rotation is wrong. This
+    /// is the failure this check exists for.
+    pub transposed: usize,
+    /// Neither pairing matched exactly. Expected at a low rate: vbsp truncates
+    /// `int(length / units_per_luxel)`, so a displacement whose edge lands on
+    /// an integer luxel boundary can differ by one from a recomputation over
+    /// the final BSP winding, which vbsp clipped after computing this.
+    pub inconclusive: usize,
+    /// Displacements whose stored grid is square, where a transpose is
+    /// invisible. Reported so the check's discriminating power is visible
+    /// rather than assumed.
+    pub square: usize,
+}
+
+/// Cross-check the luxel axes against the dimensions vbsp stored.
+///
+/// [`corner_luxel_coords`] assigns `m_LightmapTextureSizeInLuxels[0]` to the
+/// axis running corner 0 -> 3 and `[1]` to corner 0 -> 1. Nothing in that
+/// function can detect getting those backwards — the coordinates it produces
+/// are inside `0..1` either way. The only independent evidence available is
+/// the map itself: recompute what vbsp's own formula would have derived from
+/// the parent quad's edge lengths, and see whether it matches the stored pair
+/// directly or transposed.
+pub fn check_luxel_axes(bsp: &Bsp) -> Result<LuxelAxisCheck> {
+    let dispinfos = bsp.dispinfos()?;
+    let faces = bsp.faces()?;
+    let texinfos = bsp.texinfos()?;
+    let positions = bsp.vertices()?;
+    let edges = bsp.edges()?;
+    let surfedges = bsp.surfedges()?;
+
+    let mut check = LuxelAxisCheck::default();
+    for disp in dispinfos {
+        let Some(face) = faces.get(disp.map_face as usize) else {
+            continue;
+        };
+        let Some(texinfo) = usize::try_from(face.texinfo)
+            .ok()
+            .and_then(|i| texinfos.get(i))
+        else {
+            continue;
+        };
+        let Some(ring) = face_quad(
+            face.firstedge,
+            face.numedges,
+            surfedges,
+            edges,
+            positions,
+        ) else {
+            continue;
+        };
+        let corners = corner_ring(ring, disp.start_position);
+        let Some(computed) = luxel_dims_from_edges(&corners, texinfo) else {
+            continue;
+        };
+
+        let stored = face.lightmap_texture_size_in_luxels;
+        if stored[0] == stored[1] {
+            check.square += 1;
+        }
+        if computed == stored {
+            check.agree += 1;
+        } else if computed == [stored[1], stored[0]] {
+            check.transposed += 1;
+        } else {
+            check.inconclusive += 1;
+        }
+    }
+    Ok(check)
+}
+
+/// The lightmap coordinate [`corner_luxel_coords`] and [`grid_coord`] produce
+/// for grid vertex `(i, j)`, in closed form.
+///
+/// Substituting the four luxel corners into the bilinear collapses to this:
+///
+/// ```text
+/// u = (0.5 + U * j / (side - 1)) / (U + 1)
+/// v = (0.5 + V * i / (side - 1)) / (V + 1)
+/// ```
+///
+/// Note **`u` follows `j` and `v` follows `i`** — the axes cross, because `i`
+/// walks corner 0 -> 1, which is the V edge. That transposition is the single
+/// easiest thing to get backwards here and the reason this exists: it is a
+/// second, independent derivation of the same quantity, so comparing the two
+/// is a real check rather than a restatement.
+pub fn analytic_lightmap_uv(face: &DFace, side: usize, i: usize, j: usize) -> [f32; 2] {
+    let size = face.lightmap_texture_size_in_luxels;
+    let step = (side - 1).max(1) as f32;
+    [
+        (0.5 + size[0] as f32 * j as f32 / step) / face.lightmap_width() as f32,
+        (0.5 + size[1] as f32 * i as f32 / step) / face.lightmap_height() as f32,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,7 +784,10 @@ mod tests {
         assert_eq!(corners[3], [1.5 / 2.0, 0.5 / 122.0]);
 
         // Every grid coordinate is then a convex combination of those, so it
-        // cannot leave 0..1 — which is the invariant `lmdump` now enforces.
+        // cannot leave 0..1. Worth stating, but note it is a *property of the
+        // formula*, not a test of it: no implementation of `corner_luxel_coords`
+        // returning corners inside the rect could fail this. The checks with
+        // teeth are the two below.
         for i in 0..=8 {
             for j in 0..=8 {
                 let uv = grid_coord(&corners, i as f32 / 8.0, j as f32 / 8.0);
@@ -641,6 +797,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two independent derivations of the same coordinate must agree.
+    ///
+    /// The builder interpolates four corner values; [`analytic_lightmap_uv`]
+    /// evaluates the closed form that bilinear collapses to. They share no
+    /// code, so agreement is evidence rather than a restatement.
+    /// Slack for the two derivations' differing operation order. One ULP near
+    /// 1.0 is about 1.2e-7; the smallest luxel step this must not mask is
+    /// 1/126 of the rect, or ~8e-3.
+    const CLOSED_FORM_TOLERANCE: f32 = 1e-6;
+
+    #[test]
+    fn the_closed_form_agrees_with_the_interpolated_grid() {
+        // Square, wide, tall, and the degenerate Badlands 2 x 122 case.
+        for size in [[8, 8], [24, 7], [1, 121], [125, 3]] {
+            let mut face: DFace = bytemuck::Zeroable::zeroed();
+            face.lightmap_texture_size_in_luxels = size;
+            let corners = corner_luxel_coords(&face);
+
+            for side in [5usize, 9, 17] {
+                let step = (side - 1) as f32;
+                for i in 0..side {
+                    for j in 0..side {
+                        let built =
+                            grid_coord(&corners, i as f32 / step, j as f32 / step);
+                        let closed = analytic_lightmap_uv(&face, side, i, j);
+                        // Not bit-identical: the two evaluate the same
+                        // expression in a different order, so they differ by
+                        // an ULP or so. A wrong axis or inset is off by whole
+                        // luxels — orders of magnitude above this.
+                        for axis in 0..2 {
+                            assert!(
+                                (built[axis] - closed[axis]).abs() <= CLOSED_FORM_TOLERANCE,
+                                "size {size:?} side {side} vertex ({i}, {j}):                                  built {built:?} vs closed {closed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The check above would be worthless if U and V were interchangeable.
+    ///
+    /// Transposing the stored luxel dimensions must move the coordinates, and
+    /// `u` must follow `j` while `v` follows `i` — the axes cross, because `i`
+    /// walks corner 0 -> 1, which is the V edge.
+    #[test]
+    fn the_luxel_axes_are_not_interchangeable() {
+        let mut face: DFace = bytemuck::Zeroable::zeroed();
+        face.lightmap_texture_size_in_luxels = [24, 7];
+        let mut swapped: DFace = bytemuck::Zeroable::zeroed();
+        swapped.lightmap_texture_size_in_luxels = [7, 24];
+
+        // Somewhere off both diagonals, so a transpose cannot coincide.
+        let (side, i, j) = (9usize, 2, 6);
+        assert_ne!(
+            analytic_lightmap_uv(&face, side, i, j),
+            analytic_lightmap_uv(&swapped, side, i, j),
+            "a transposed luxel grid must produce different coordinates"
+        );
+
+        // u varies with j alone; v with i alone.
+        let base = analytic_lightmap_uv(&face, side, i, j);
+        assert_eq!(analytic_lightmap_uv(&face, side, i + 1, j)[0], base[0]);
+        assert_ne!(analytic_lightmap_uv(&face, side, i + 1, j)[1], base[1]);
+        assert_ne!(analytic_lightmap_uv(&face, side, i, j + 1)[0], base[0]);
+        assert_eq!(analytic_lightmap_uv(&face, side, i, j + 1)[1], base[1]);
+    }
+
+    /// [`luxel_dims_from_edges`] transcribes `CalcLuxelCoords`' length rule.
+    #[test]
+    fn luxel_dims_come_from_the_longer_edge_of_each_axis() {
+        // 16 units per luxel, the common TF2 lightmap scale.
+        let mut texinfo: TexInfo = bytemuck::Zeroable::zeroed();
+        texinfo.lightmap_vecs[0] = [1.0 / 16.0, 0.0, 0.0, 0.0];
+        texinfo.lightmap_vecs[1] = [0.0, 1.0 / 16.0, 0.0, 0.0];
+
+        // A trapezoid: the 0->3 edge is 128 long, 1->2 is 160. Valve takes the
+        // longer of the pair, so U must come from 160, not 128.
+        let corners = [
+            [0.0, 0.0, 0.0],
+            [0.0, 64.0, 0.0],
+            [160.0, 64.0, 0.0],
+            [128.0, 0.0, 0.0],
+        ];
+        assert_eq!(
+            luxel_dims_from_edges(&corners, &texinfo),
+            Some([160 / 16 + 1, 64 / 16 + 1]),
+        );
+
+        // Degenerate lightmap vectors have no scale to divide by.
+        let zeroed: TexInfo = bytemuck::Zeroable::zeroed();
+        assert_eq!(luxel_dims_from_edges(&corners, &zeroed), None);
     }
 
     #[test]
