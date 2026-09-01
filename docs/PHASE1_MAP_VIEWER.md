@@ -33,7 +33,7 @@ Measured directly from `C:\Program Files (x86)\Steam\steamapps\common\Team Fortr
 - **233 loose `.bsp` files** in `tf/maps/`. All 233 are **`VBSP` version 20** (verified exhaustively by the M1 sweep) — matches `BSPVERSION 20` in bspfile.h. No VPK extraction needed for maps.
 - **⚠️ 48 of 64 lumps are LZMA-compressed** in `cp_badlands.bsp`. `lump_t.uncompressedSize != 0` signals compression. This is the single most common thing naive readers get wrong — it is mandatory, not optional.
   - Verified lump body begins with the 17-byte Valve header: magic `"LZMA"`, `actualSize: u32`, `lzmaSize: u32`, `properties: [u8; 5]` (observed `5d 00 00 00 01` = lc/lp/pb + 16 MB dict), then a **raw LZMA1 stream with no end marker** — output size must be supplied externally.
-  - `LUMP_GAME_LUMP` (35) and `LUMP_PAKFILE` (40) are **not** compressed.
+  - `LUMP_GAME_LUMP` (35) and `LUMP_PAKFILE` (40) are **not** compressed. ~~So nothing inside them is, either.~~ **Wrong for GAME_LUMP** — its `lump_t.uncompressedSize` is indeed 0, but each *game lump within it* carries its own `GAMELUMPFLAG_COMPRESSED` and its own Valve LZMA header, and 177 of the 233 maps use it. See [PHASE2_SKY_WATER_PROPS.md](PHASE2_SKY_WATER_PROPS.md).
 - `LUMP_PAKFILE` starts with `PK\x03\x04` — a plain zip.
 - `LUMP_GAME_LUMP` reports 3 game lumps.
 - `tf2_textures_dir.vpk`: signature `0x55aa1234`, **version 2**, tree size 1 586 352.
@@ -535,9 +535,11 @@ For each: fly the map, confirm no missing terrain, no missing textures (log ever
 
 ## Out of scope — phase 2 and later
 
-Called out explicitly so phase 1 doesn't creep:
+Planned in detail in [PHASE2_SKY_WATER_PROPS.md](PHASE2_SKY_WATER_PROPS.md), which
+takes these in the order sky → water → 3D skybox → props. Called out here
+explicitly so phase 1 doesn't creep:
 
-- **Static props** — `LUMP_GAME_LUMP` `'sprp'` ([gamebspfile.h:28](../../source-sdk-2013/src/public/gamebspfile.h#L28), version 10) plus a full MDL/VVD/VTX loader. This is the single biggest visual gap after phase 1 and the natural start of phase 2.
+- **Static props** — `LUMP_GAME_LUMP` `'sprp'` ([gamebspfile.h:28](../../source-sdk-2013/src/public/gamebspfile.h#L28)) plus a full MDL/VVD/VTX loader. This is the single biggest visual gap after phase 1 and the natural start of phase 2. (The "version 10" this line used to assert is only the *most common* of four versions TF2 ships — v10, v7, v6 and v5.)
 - Detail props (`'dprp'`), overlays/decals, cubemap reflections, 3D skybox, real water shaders, `$bumpmap` / phong / self-illum.
 - VIS/PVS culling — Bevy's frustum culling is sufficient for a viewer at these poly counts.
 - Entity logic, brush-entity *motion*, collision, VPhysics, netcode, gameplay.
