@@ -11,11 +11,13 @@
 //! see its docs for why triangle winding survives untouched.
 
 pub mod material;
+pub mod sky;
 
 pub use material::{
     load_materials, MapMaterials, MaterialContext, MaterialStats, SourceMaterial,
     SourceMaterialPlugin, SOURCE_OVERBRIGHT,
 };
+pub use sky::{Sky, SkyBox, SkyFace, SkyMaterial, SkyPlugin};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::Exposure;

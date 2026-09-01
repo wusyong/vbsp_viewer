@@ -84,7 +84,7 @@ pub fn update_hud(
          {:.1} ms/frame  ({:.0} fps{}){}\n\
          \n\
          WASD/QE move, Shift sprint, click to look, Esc release\n\
-         F1 overlay  F2 wireframe  F3 brushes  F4 terrain  F5 textures",
+         F1 overlay  F2 wireframe  F3 brushes  F4 terrain  F5 textures  F6 sky",
         info.name,
         info.bsp_version,
         info.materials,

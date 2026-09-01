@@ -625,6 +625,7 @@ dependencies = [
  "bevy",
  "bsp",
  "half",
+ "thiserror 2.0.20",
  "vfs",
  "vtf",
 ]

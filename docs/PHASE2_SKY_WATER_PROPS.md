@@ -93,9 +93,10 @@ By contrast **VVD is version 4 and VTX version 7, uniformly** (14 065 and 14 064
 
 - Shader is **`sky`**, not `SkyBox`. `sky_badlands_01up.vmt` is `$basetexture skybox/sky_badlands_01up`, `$hdrbasetexture` (same LDR path), `$nofog 1`, `$ignorez 1`.
 - 964 files under `materials/skybox/`; **179 are `_hdr` variants** named `<name>_hdr<face>`, mostly HL2 — TF2's own skies point `$hdrbasetexture` at the LDR texture, so **LDR is the correct default**.
-- **⚠️ Sky faces are neither square nor uniform.** `sky_badlands_01`: the four sides are **512 × 256**, `up` and `dn` are **512 × 512**, all `BGR888`, VTF 7.4, flagged `CLAMPS | CLAMPT | NOMIP | NOLOD`. A cubemap needs six equal square faces, so these cannot feed `bevy_light::Skybox` directly. `BGR888` also means CPU decode — no BC passthrough.
+- **⚠️ Sky faces are neither square nor uniform.** `sky_badlands_01`: the four sides are **512 × 256**, `up` and `dn` are **512 × 512**, all `BGR888`, VTF 7.4, flagged `CLAMPS | CLAMPT | NOMIP | NOLOD`. A cubemap needs six equal square faces, which is why the engine draws the sky as six *2D* textures instead — see M9. `BGR888` also means CPU decode — no BC passthrough.
 - **Sky formats vary.** Several skies (`sky_trainyard_01`, `sky_night_01`, `sky_alpinestorm_01`) are `DXT1`, and some sets are not named `<skyname><face>` uniformly (`sky_dustbowl_01rt.vtf` does not exist under that name). Our `vtf` crate already decodes every format present; a loader must resolve the face texture through the **VMT's `$basetexture`** rather than guessing the filename.
-- **The face → cubemap-slot arrangement is derivable, not guessable.** A cube's six faces are one continuous image, so sampling either side of each of the twelve shared edges must agree. Scored over `sky_badlands_01` during planning, the best arrangement came in at **8.94** mean per-channel difference against **47.80** for the worst — a clear signal. Two caveats found: a sky whose `up`/`dn` are near-uniform cannot pin those two rotations, so the search must aggregate several skies; and the search must include mirroring, not just quarter turns.
+- **⚠️ There is no cubemap in Source's drawn sky.** The `Sky` shader is 2D throughout — one texcoord set, `tex2D`, `UnlitGeneric` as its dx6 fallback, and `texCUBE` in none of its files — and the engine's sky interface is `SkyBoxMaterials_t`, six *materials* ([public/cdll_int.h:123](../../source-sdk-2013/src/public/cdll_int.h#L123)). Each face is `CLAMPS | CLAMPT | NOMIP | NOLOD`, so nothing filters across a face join or leaves mip 0. Citations and consequences in M9.
+- **⚠️ Valve ships two different face orderings, and `bk`/`lf` are swapped between them.** The **drawn sky** uses `rt, bk, lf, ft, up, dn` ([cdll_int.h:125](../../source-sdk-2013/src/public/cdll_int.h#L125), [skyboxswapper.cpp:60](../../source-sdk-2013/src/game/server/skyboxswapper.cpp#L60), [vscript_server.cpp:2190](../../source-sdk-2013/src/game/server/vscript_server.cpp#L2190)); the **reflection cubemap** uses `rt, lf, bk, ft, up, dn` ([cubemap.cpp:195](../../source-sdk-2013/src/utils/vbsp/cubemap.cpp#L195), matching `CubeMapFaceIndex_t`). Anything that indexes a six-element list *positionally* from the wrong file is silently wrong. Take directions from `CubeMapFaceIndex_t`'s per-face comments, never from slot position.
 
 ### Water materials
 
@@ -119,7 +120,10 @@ crates/
             examples/mdldump.rs
   vfs/      (unchanged — pakfile mounting already covers packed models)
   vtf/      (unchanged — cubemap faces already exposed via surface())
-  bevy_bsp/ + sky.rs, water.rs, props.rs
+  bevy_bsp/ + sky.rs   (M9: six quads, six native-size 2D faces — no cubemap)
+            + water.rs (M10)
+            + props.rs (M14)
+            examples/skydump.rs
 ```
 
 `crates/mdl` returns plain vertex/index buffers plus material names, exactly as `bsp::geometry` does, so the Bevy layer stays a thin adapter. Static props are rigid, so **no skinning** in Phase 2 — but bone transforms are read, because a model's bind pose is not guaranteed to be identity.
@@ -130,15 +134,305 @@ crates/
 
 Same rule as Phase 1: each ends in something observable, and a failing verification stops the milestone.
 
-### M9 — 2D skybox
+### M9 — 2D skybox, as six quads
 
-- `worldspawn`'s `skyname` → `materials/skybox/<name>{rt,lf,bk,ft,up,dn}.vmt`, shader `sky`. **Resolve the texture through `$basetexture`**, not by filename convention.
-- **Resample all six faces to one square edge** (the largest dimension in the set, 512 for TF2) and assemble a 6-layer cubemap `Image` — `depth_or_array_layers: 6` plus `texture_view_descriptor` with `TextureViewDimension::Cube`, as `bevy_image/src/dds.rs:91-101` does — then hand it to `bevy_light::Skybox { image, brightness, rotation }`. Resampling is what the GPU does anyway when stretching a 512 × 256 side across a square face; this does the stretch once, at load.
-- **Derive the face arrangement, don't guess it.** Score candidate slot assignments and rotations by edge continuity across all twelve cube edges (method and numbers above), aggregating over several skies so near-uniform caps cannot leave a rotation undetermined. Hard-code the winner as a table with the evidence in its doc comment, and add a test asserting that turning any single face makes the score worse.
-- `Skybox::brightness` multiplies by `Exposure` exactly as M5's `lightmap_exposure` did — reuse that reasoning (`bevy_bsp::lightmap_exposure`) rather than hardcoding a number.
-- Sky *geometry* stays skipped as Phase 1 already does (`SURF_SKY`/`SURF_SKY2D` faces are dropped); the cubemap fills those pixels.
+> **This milestone was rewritten after the first attempt was reverted.** The
+> original plan assembled one cubemap and searched for the face arrangement; that
+> is retired, for the reasons under *M9 findings* below. The SDK does not build a
+> cubemap for the drawn sky, and following it removes the entire seam class
+> rather than tuning it.
 
-**Verify:** every distinct `skyname` across the 233 maps assembles six faces with none missing; a `skydump` example writes the cubemap cross to BMP for eyeballing and prints the continuity score; `--screenshot` on 10 maps shows a correctly oriented horizon with no seam.
+**Source's 2D sky is six independent quads with six independent 2D textures.**
+The `Sky` shader takes `VERTEX_POSITION` plus **one 2D texcoord set**
+([sky_dx9.cpp:59](../../source-sdk-2013/src/materialsystem/stdshaders/sky_dx9.cpp#L59)),
+samples with `tex2D`
+([sky_ps2x.fxc](../../source-sdk-2013/src/materialsystem/stdshaders/sky_ps2x.fxc)),
+and falls back to plain `UnlitGeneric` on dx6
+([sky_dx6.cpp:13](../../source-sdk-2013/src/materialsystem/stdshaders/sky_dx6.cpp#L13)).
+`texCUBE` appears in **no** sky shader file. The engine's own sky interface is
+six *materials*:
+
+```c
+struct SkyBoxMaterials_t
+{
+	// order: "rt", "bk", "lf", "ft", "up", "dn"
+	IMaterial *material[6];
+};
+```
+— [public/cdll_int.h:123](../../source-sdk-2013/src/public/cdll_int.h#L123)
+
+Six 2D textures is also the only thing consistent with the files: sides are
+512 × 256 and caps 512 × 512, which no cubemap can hold. And each face carries
+`CLAMPS | CLAMPT | NOMIP | NOLOD`, so the engine never filters across a face
+boundary and never leaves mip 0.
+
+**Steps:**
+
+- `worldspawn`'s `skyname` → `materials/skybox/<name>{rt,lf,bk,ft,up,dn}.vmt`,
+  shader `sky`. **Resolve the texture through `$basetexture`**, not by filename
+  convention — `sky_hydro_01dn` points at `sky_hydro_01bk`, and
+  `sky_dustbowl_01rt.vtf` does not exist under that name. A face with no
+  `$basetexture` becomes a 1 × 1 of its `$color`.
+- **Six separate `Image`s at native size.** No resampling: each face keeps its
+  own dimensions. `mip_level_count: 1`, `ClampToEdge` on u and v, `Linear`
+  mag/min. That reproduces `CLAMPS | CLAMPT | NOMIP | NOLOD` exactly — the GPU
+  then *cannot* blend across a face join or drop to a coarser mip, so neither can
+  produce a seam even if a face is oriented wrong.
+- **⚠️ A half-height face fills the top of the cube face; it does not stretch.**
+  The line above about keeping native dimensions is right, but the mapping onto
+  the square face is *not* a stretch: a 512 × 256 side holds only the sky above
+  the horizon and belongs in the face's top half with its last row repeated
+  below. Measured on the mixed-height skies — see the findings. This is why every
+  sky face carries `CLAMPT`, and it needs no code beyond running the quad's `v`
+  from 0 to `width / height`.
+- **A box of six quads, translation-synced to the camera** (not parented —
+  parenting would rotate the sky with the view). One `Material` per face,
+  `unlit`, with `specialize()` setting `depth_write_enabled: false` — that is the
+  usable half of `MATERIAL_VAR_IGNOREZ`
+  ([sky_dx9.cpp:34](../../source-sdk-2013/src/materialsystem/stdshaders/sky_dx9.cpp#L34)).
+  Source can ignore depth entirely because the engine draws the sky in a known
+  slot; Bevy's opaque phase is *binned*, not distance sorted, so there is no draw
+  order to lean on. Leaving the depth **test** on while turning **write** off is
+  order-independent: drawn first the sky passes a cleared buffer and writes
+  nothing, drawn last it fails wherever geometry already sits. That is why the box
+  has a real radius scaled to the map rather than sitting at unit distance — the
+  depth test is doing real work, so the box has to be genuinely further away than
+  the map.
+- **The four sides are determined by axes, not by search.** Facing outward with
+  image `u` to the right and `v` down, in Source's Z-up axes:
+
+  | face | outward | `u` along | `v` along |
+  |---|---|---|---|
+  | `rt` | +X | −Y | −Z |
+  | `lf` | −X | +Y | −Z |
+  | `bk` | +Y | +X | −Z |
+  | `ft` | −Y | −X | −Z |
+
+  Directions from `CubeMapFaceIndex_t`'s own comments — `BACK` is +Y, `FRONT` is
+  −Y ([public/vtf/vtf.h:135](../../source-sdk-2013/src/public/vtf/vtf.h#L135)).
+  Because we author the quads, there is no external cube convention to fight and
+  no mirror to discover; the previous attempt's per-face flip was an artifact of
+  wgpu's cube face conventions and disappears here.
+- **The two caps need one measurement each, and it is well posed.** With the four
+  sides pinned above, `up` is fixed by its four edges against them — the pole
+  measurement in the findings below already answers this over four skies with a
+  ten-fold margin, and needs only re-expressing in the quad frame. `dn` is
+  undeterminable from anything TF2 ships; match it to `up` and label that a
+  convention.
+- Express each face's orientation as a **2 × 3 UV transform**, which is exactly
+  Source's `$basetexturetransform`
+  ([sky_dx9.cpp:108](../../source-sdk-2013/src/materialsystem/stdshaders/sky_dx9.cpp#L108)).
+  A wrong face is then one table row, not a repacked texture.
+- Apply a **half-texel inset** if a hairline survives at a quad edge, using
+  Valve's own constant: `0.5/w − 0.01/max(w,h)`
+  ([sky_hdr_dx9.cpp:223](../../source-sdk-2013/src/materialsystem/stdshaders/sky_hdr_dx9.cpp#L223)).
+  Inflate each quad slightly so edges overlap rather than abut, so a
+  rasterization crack cannot show through.
+- Brightness comes from `bevy_bsp::lightmap_exposure`, reusing M5's unit
+  conversion rather than a hand-tuned number.
+- Sky *geometry* stays skipped as Phase 1 already does (`SURF_SKY`/`SURF_SKY2D`
+  faces are dropped); the box fills those pixels.
+
+**Verify.** Three gates, none of which can pass by construction:
+
+1. **Coverage.** All 70 resolvable skynames load six faces, with the map's own
+   pakfile mounted (46 of the 70 need it). `sky_black_01` on `pd_atom_smash` is
+   absent from the game entirely — report, do not fail.
+2. **Side continuity, on real pixels.** Adjacent sides share a physical edge, so
+   `rt`'s shared column must match `bk`'s. Assert that for all four side↔side
+   edges, and prove the assert bites by injecting a single-face flip. This is the
+   check the original continuity *search* could not be — rejecting one wrong face
+   is well posed where ranking 6 × 8 arrangements on smooth gradients is not.
+3. **Sun position, independent of continuity.** `light_environment` (231 maps,
+   265 instances, every one carrying a `pitch` that overrides `angles[0]`) gives
+   the sun direction. The brightest region of the sky should lie there. This
+   cross-checks the whole arrangement against map data rather than against the
+   sky's own self-consistency, so it cannot be satisfied by a uniformly wrong
+   mapping — the failure mode that made every earlier iteration look plausible.
+
+Plus `skydump`, which writes each face at native size to a BMP **labelled with
+its slot** and prints the twelve per-edge differences; and `--screenshot` on 10
+maps showing a horizon at eye level with no seam.
+
+### M9 findings — delivered
+
+> **The six-quad rewrite landed and all three gates pass on all 233 maps.** What
+> follows is what the second attempt measured, including the two places where the
+> milestone above was still wrong and the three places where a gate I had just
+> written turned out to be unsound. The corrections are the point: every one was
+> found by a check firing, not by looking at a screenshot.
+
+**The plan's own numbers, delivered.** `skydump --all-maps`:
+
+| gate | result |
+|---|---|
+| 1 — coverage | **232 / 233** maps resolve a sky; the one miss is `sky_black_01` on `pd_atom_smash`, absent from every VPK and every pakfile |
+| 2 — side continuity | worst side-join spread **7.67** against a limit of 8.00 |
+| 3 — sun bearing | coherent bias **−8.8°** against a limit of ±30°, concentration 0.42, 180 maps checked |
+
+Unit tests went 118 → 137. Zero clippy warnings.
+
+#### ⚠️ A half-height face fills the top of the cube face — it does not stretch
+
+The milestone said to stretch each texture across its face. That is wrong, and
+`sky_alpinestorm_01` is the sky that proves it: its sides are 1024×512 but its
+**`bk` is 1024×1024**, one square face among three half-height ones. Under
+stretch, the two joins that involve `bk` scored **15.02 and 14.31** while every
+join between two half-height sides scored 0.25 — the shape of the face, not its
+position, decided whether the join worked.
+
+Looking at the artwork settles it. `sky_alpinestorm_01bk` (square) has its
+horizon across the middle of the image; `sky_alpinestorm_01rt` (half-height) has
+its horizon at the very bottom edge, and `sky_badlands_01rt` has no horizon at
+all — it is sky all the way down, paling toward the bottom. So a half-height face
+holds only the sky **above** the horizon, and it belongs in the top half of the
+cube face with its last row repeated below. Fitting rather than stretching:
+
+| | rt–bk | lf–bk | bk–dn |
+|---|---|---|---|
+| stretch | 15.02 | 14.31 | 30.16 |
+| **fit** | **4.45** | **8.74** | **2.83** |
+
+Four independent lines agree:
+
+1. those numbers,
+2. the artwork inspection above,
+3. it is `CreateDefaultCubemaps`' documented rule for exactly this shape
+   ([vbsp/cubemap.cpp](../../source-sdk-2013/src/utils/vbsp/cubemap.cpp)),
+4. **`CLAMPT` is otherwise unused.** With a fit of 1 and UVs in `[0, 1]`, clamped
+   addressing never engages on any sky face. It is on all 964 of them because the
+   quad's `v` is meant to run past 1, and clamping is what repeats the last row.
+   The renderer needs no special case: Source set the flag that makes the smear
+   happen for free.
+
+Note what this reverses. An earlier attempt dismissed vbsp's fitting as
+reflection-only and stretched instead — and *that* dismissal was itself a
+correction of an earlier mistake in the opposite direction. The lesson survives
+in a sharper form: `CreateDefaultCubemaps` is the wrong function to copy for the
+sky's *arrangement* and the right one for its *fitting*. "Is this function about
+reflections or about the drawn sky" was the wrong question; the two overlap.
+
+**The visible consequence, stated plainly.** For a sky whose sides are
+half-height — most of them — everything below elevation 0° is a repeat of one
+row of texels, with a step wherever two faces' rows differ. In normal play the
+world fills that half of the view and it is never seen. Fly above the map and
+look at the horizon and it is obvious. That band is not a bug and not a seam;
+`F6` hides the sky if you need to tell the two apart.
+
+#### The cap rotations, measured
+
+`up` is rotation **3**, on **38 of the 41** skies that carry a verdict, with
+tenfold to twentyfold margins:
+
+| sky | rot0 | rot1 | rot2 | **rot3** |
+|---|---|---|---|---|
+| `sky_day01_01` | 17.02 | 17.65 | 16.92 | **0.89** |
+| `sky_premuda_` | 17.23 | 20.89 | 16.93 | **0.53** |
+| `sky_hydro_01` | 12.80 | 12.81 | 12.70 | **1.07** |
+| `sky_nightsnow_01` | 18.01 | 12.64 | 18.07 | **2.71** |
+
+Of the other 30 skynames, 27 are near-uniform in `up` and score flat across all
+four — excluded, not averaged in, because a flat cap votes for whatever the
+tie-break reaches. Three dissent with a real margin (`sky_cargo_01` and
+`sky_fuji` prefer rot 0, `sky_frankenstorm_02` rot 2) and are recorded as
+outliers rather than explained away.
+
+`dn` gets a verdict from **2 of 71** skies, both rot 1 (`overcast01` 0.47 against
+4.44/4.56/6.35; `sky_hadal_01` 2.82 against 8.84/8.91/9.32). Two skies is not a
+measurement. What promotes it above a coin flip is that rot 1 is also what `up`
+implies — `up` at rot 3 is `u = −Y, v = +X` and `dn` at rot 1 is `u = −Y, v = −X`,
+the same face reflected across the horizon. Recorded as a convention with two
+votes behind it, and excluded from the gate.
+
+#### Three gates, three corrections
+
+Each of these was a check I wrote, believed, and then had to fix because it was
+measurably unsound. Worth recording in that order, because each looked fine until
+it was pointed at real data.
+
+**Gate 3, first version: the brightest texels.** Took the luminance-weighted
+centroid of the brightest 0.05% of texels. On a hazy sky those are not the sun —
+they are the bright band along the horizon, which runs the whole way round the
+compass and whose centroid points **straight down**. `sky_badlands_01`'s sun came
+out at elevation −76°. A mean of directions on a sphere is meaningless unless
+they are clustered, and nothing tells you in advance whether they are. Replaced
+with a **compass profile**: mean brightness per 5° of yaw. A uniform horizon band
+contributes equally to every bin and cancels out of the comparison.
+
+**Gate 3, second version: a v-uniform band is not elevation-uniform.** A cube
+face's rows are not lines of constant elevation — at face coordinate `v` the
+elevation is `atan(dv / sqrt(1 + du²))`, 45° mid-face and 35° at the corner. So
+"the whole upper half" samples a different elevation range at different yaws, and
+the horizon gradient leaks in as a spurious 90°-period modulation. On a synthetic
+sky uniform in yaw *by construction* that leak reported a prominence of 0.67,
+which would have read as a strong sun. Fixed by restricting to a fixed elevation
+band computed from the direction, 5° to 30°.
+
+**Gate 3, third version: per-map pass/fail is not a sound test.**
+`arena_nucleus` and `arena_offblast_final` use the **same** `sky_goldrush_01`
+artwork and reported 72° and 40°. Identical pixels, different answers — so the
+disagreement is in the maps, not the sky. Mappers aim `light_environment` by eye
+against artwork they did not paint, and on night maps it is a dim fill light
+pointed wherever. What a wrong *arrangement* produces is different in kind: a
+**coherent** bias, every map's signed error moving together. So the statistic is
+the circular mean of the signed errors, which mapper sloppiness cannot move and a
+rotation moves entirely.
+
+**Gate 2: the mean hides which half of the edge is wrong.**
+`sky_stranded_01`'s `lf`–`ft` join has a mean difference of 39.93 on four square,
+same-size faces, while its other three joins score 0.04, 2.48 and 3.09. Sampling
+the two columns:
+
+```text
+ft right column:  35,57,74  35,57,74  52,78,95 ... 48,73,90    0,0,0  0,0,0 ...
+lf left column:   35,57,74  35,57,74  52,79,95 ... 48,73,90  62,92,110 ...
+```
+
+The top half agrees to the byte and the bottom half of `ft` is **pure black** —
+the sky ships that way. Raising the limit until it passed would have blinded the
+gate to real errors of the same size; excluding the sky by name would need
+redoing for every such sky. The two causes differ in *kind*: a mirrored or
+rotated face is wrong at every point along the edge, an artwork defect is wrong
+over part of it and exact over the rest. So the gate reads the **20th percentile**
+along the edge, not the mean — and the limit came down from 12 to 8.
+
+#### Brightness: not the lightmap's exposure factor
+
+`sky_brightness()` first returned `lightmap_exposure(1.0)`, about 1000, reasoning
+that a sky texel is an albedo and should land where a fully lit white surface
+lands. Right about the goal, wrong about the path: Bevy applies `Exposure` inside
+`apply_pbr_lighting`, which a lit surface goes through and a custom sky shader
+does not. `pl_badwater`'s sky came out flat blown-out white. The correct
+comparison is with an **unlit** surface, which also skips that path and emits
+`base_color` as-is — so the multiplier is **1.0**, and a sky texel of 0.7 sits
+next to a lit wall of albedo 0.35 at full light exactly as it does in Source.
+
+#### Proving the gates bite
+
+Both surviving gates were validated by injecting the bug each targets, on real
+data across all 233 maps.
+
+| injection | gate 2 (spread) | gate 3 (bias) |
+|---|---|---|
+| none | 7.67 — pass | −8.8° — pass |
+| `rt`'s `u` mirrored | **20.33 — fail** | — |
+| whole sky turned 90° | **7.67 — pass** | **+81.2° — fail** |
+
+The second row is the one that matters. A 90° rotation keeps the side band
+perfectly continuous, so gate 2 reports the *identical* 7.67 and is completely
+blind to it — while gate 3's error histogram shifts wholesale, its 51-map peak
+moving from −15..+15° to +75..+105° with the shape unchanged. That is precisely
+the failure mode that made the first attempt's iterations look plausible, and
+gate 2 alone could never have caught it.
+
+Unit-test side: mirroring `rt` fires `axes_are_not_mirrored` and
+`sides_join_without_a_gap`; `edge_report_catches_a_single_mirrored_face` mirrors
+each of the six faces in turn and requires the spread to quadruple;
+`cap_scores_recovers_a_planted_rotation` plants each of the four rotations and
+requires the measurement to find it — deliberately *not* the tautology of
+building a sky with `SkyFace::axes` and asserting the answer is `UP_ROTATION`,
+which cannot fail; and `a_localised_artwork_defect_is_not_a_mapping_error` blacks
+out half a face and requires the mean to jump while the spread does not.
 
 ### M10 — Water
 
@@ -217,7 +511,7 @@ The milestone that makes props belong rather than float.
 
 ```bash
 cargo test --workspace
-cargo run -p bevy_bsp --example skydump -- --all-maps "<tf dir>" # M9:  every skyname, continuity scored
+cargo run -p bevy_bsp --example skydump -- --all-maps "<tf dir>" # M9:  every skyname, per-edge + sun check
 cargo run -p bsp --example propdump -- --all-maps   "<tf dir>"   # M12: 353 116 props, all 4 sprp versions
 cargo run -p mdl --example mdldump  -- --all-models "<tf dir>"   # M13: 16 215 MDL/VVD/VTX sets
 cargo run -p mdl --example mdldump  -- --all-maps   "<tf dir>"   # M13: needs M12 for the model list
@@ -227,7 +521,7 @@ cargo run --release -- --map <name> --screenshot out.png         # ~10 maps by d
 **Two lessons from Phase 1 that apply directly:**
 
 - **"No errors" is not "correct output".** M8's 233-maps-0-failures claim hid three empty frames. Keep measuring screenshot coverage — and extend it, because a map whose prop *count* is right but whose props are all at the origin passes every count-based gate.
-- **A check that cannot fail is worse than no check.** The retired terrain-UV gate looked like evidence while being true by construction. Every new invariant here should be validated by deliberately injecting the bug it targets — that is how both displacement checks were confirmed, and how M9's sky arrangement will be.
+- **A check that cannot fail is worse than no check.** The retired terrain-UV gate looked like evidence while being true by construction. Every new invariant here should be validated by deliberately injecting the bug it targets — that is how both displacement checks were confirmed, and how M9's side-continuity assert must be.
 
 **Manual:** fly `cp_badlands`, `ctf_2fort`, `pl_upward` and `koth_lakeside_final`. Confirm sky orientation, water at the right height, props on the ground and lit like their surroundings, and an empty unresolved-material log.
 
@@ -250,5 +544,5 @@ cargo run --release -- --map <name> --screenshot out.png         # ~10 maps by d
 | Game lump compressed span read from `filelen` → garbage props | Span comes from the next entry's `fileofs`. 177 maps compressed and 56 not, so the sweep exercises both paths. |
 | `sprp` v7 assumed identical to v10 because both are 72 bytes | Check against the SDK's V6/V10 structs; it is 1 map and 536 props, so fail closed with a warning rather than guess. |
 | 3D skybox needs leaf partitioning Phase 1 lacks | Build it as its own reviewable step in M11 — it is also the groundwork VIS culling needs. |
-| Sky cubemap face rotations wrong → seams or a flipped sky | Derive by edge continuity over several skies, not by convention; test that turning any single face worsens the score. |
+| Sky face orientation wrong → seams or a flipped sky | Six clamped 2D faces make cross-face filtering impossible, so a wrong face shows as wrong *content*, not as a hairline. Sides come from the SDK's axes; the two caps are measured. Cross-check against `light_environment`'s sun direction, which no self-consistent-but-wrong mapping can satisfy. |
 | Prop counts hurt frame time (4 383 on `pl_patagonia`) | Instance per unique model; honour `m_FadeMaxDist`; measure with the existing F1 frame timing before optimising. |

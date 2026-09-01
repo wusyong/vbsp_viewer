@@ -7,6 +7,7 @@ description = "Bevy integration for Source engine BSP maps"
 [dependencies]
 bevy.workspace = true
 half.workspace = true
+thiserror.workspace = true
 bsp = { path = "../bsp" }
 vfs = { path = "../vfs" }
 vtf = { path = "../vtf" }

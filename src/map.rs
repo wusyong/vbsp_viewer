@@ -5,7 +5,7 @@
 //! a frame budget's worth of patience.
 use crate::camera::FlyCamera;
 use crate::cli::Args;
-use crate::viewpoint::default_viewpoint;
+use crate::viewpoint::{default_viewpoint, trimmed_bounds};
 use bevy::prelude::*;
 use bevy_bsp::{MapInfo, SourceMaterial};
 use bsp::geometry::ModelGeometry;
@@ -27,6 +27,7 @@ pub fn load_map(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SourceMaterial>>,
+    mut sky_materials: ResMut<Assets<bevy_bsp::SkyMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut info: ResMut<MapInfo>,
     mut camera: Query<(&mut Transform, &mut FlyCamera)>,
@@ -237,6 +238,19 @@ pub fn load_map(
         warn!("no texture at {missing}");
     }
 
+    if !args.no_sky
+        && let Some(vfs) = vfs.as_ref() {
+            spawn_sky(
+                &mut commands,
+                &mut meshes,
+                &mut sky_materials,
+                &mut images,
+                vfs,
+                &entities,
+                &world,
+            );
+        }
+
     let start = default_viewpoint(&world, &entities);
     if let Ok((mut transform, mut fly)) = camera.single_mut() {
         transform.translation = args
@@ -258,6 +272,76 @@ pub fn load_map(
         info.brush_entities,
         info.brush_entity_triangles,
         started.elapsed().as_secs_f32() * 1000.0,
+    );
+}
+
+/// Spawn the six sky quads for whatever sky `worldspawn` names.
+///
+/// # Why this is six entities and not one
+///
+/// Source draws the 2D sky as six independent quads with six independent 2D
+/// textures — see [`bevy_bsp::sky`] for the SDK citations. Each face keeps its
+/// own dimensions, so nothing is resampled, and each gets its own clamped,
+/// single-mip texture, so the GPU physically cannot filter across a face join or
+/// drop to a coarser mip near the horizon. Those two properties are what make a
+/// seam impossible rather than unlikely.
+///
+/// A missing sky is a warning, not a failure: `sky_black_01` on `pd_atom_smash`
+/// is absent from the game entirely, and the engine carries on too.
+fn spawn_sky(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    sky_materials: &mut Assets<bevy_bsp::SkyMaterial>,
+    images: &mut Assets<Image>,
+    vfs: &vfs::Vfs,
+    entities: &[vfs::Entity],
+    world: &ModelGeometry,
+) {
+    use bevy_bsp::sky;
+
+    let Some(skyname) = vfs::entities::worldspawn(entities).and_then(|w| w.get("skyname")) else {
+        warn!("worldspawn names no skyname; no sky drawn");
+        return;
+    };
+    let loaded = match sky::load(vfs, skyname) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            warn!("{skyname}: {e}; no sky drawn");
+            return;
+        }
+    };
+
+    // The box is centred on the camera and depth-tested, so it has to be
+    // genuinely further away than anything in the map. See `sky::sky_radius`.
+    let diagonal = match trimmed_bounds(world) {
+        Some((lo, hi)) => {
+            let span = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            bevy_bsp::src_to_bevy(span).length()
+        }
+        None => 0.0,
+    };
+    let radius = sky::sky_radius(diagonal);
+    let brightness = sky::sky_brightness();
+
+    for face in sky::SkyFace::ALL {
+        let texture = loaded.face(face);
+        let material = sky_materials.add(bevy_bsp::SkyMaterial {
+            texture: images.add(sky::face_image(texture)),
+            params: sky::SkyParams {
+                brightness,
+                ..default()
+            },
+        });
+        commands.spawn((
+            Mesh3d(meshes.add(sky::face_mesh(face, radius, texture.vertical_fit()))),
+            MeshMaterial3d(material),
+            Transform::default(),
+            sky::SkyBox,
+            Name::new(format!("sky {}", face.suffix())),
+        ));
+    }
+    info!(
+        "sky {skyname}: six faces, box radius {radius:.0} m (map diagonal {diagonal:.0} m)"
     );
 }
 

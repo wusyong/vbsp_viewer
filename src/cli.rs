@@ -50,6 +50,10 @@ pub struct Args {
     #[arg(long)]
     pub no_lightmap: bool,
 
+    /// Do not draw the 2D skybox.
+    #[arg(long)]
+    pub no_sky: bool,
+
     /// Skip `$basetexture` and paint each material a flat debug colour — the
     /// M5 look, for telling a lighting problem from a texture problem.
     #[arg(long)]

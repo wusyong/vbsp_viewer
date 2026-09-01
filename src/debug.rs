@@ -8,14 +8,14 @@ use crate::cli::Args;
 use crate::hud::HudText;
 use bevy::pbr::wireframe::WireframeConfig;
 use bevy::prelude::*;
-use bevy_bsp::{DisplacementGeometry, MapGeometry, SourceMaterial, SurfaceInfo};
+use bevy_bsp::{DisplacementGeometry, MapGeometry, SkyBox, SourceMaterial, SurfaceInfo};
 
 /// Visibility of brush geometry and of terrain, as two provably disjoint
 /// queries.
 ///
-/// Each filter excludes the *other* marker as well as the HUD. Without that,
-/// Bevy cannot prove two `&mut Visibility` queries do not overlap — an entity
-/// could in principle carry both markers — and panics with B0001.
+/// Each filter excludes every *other* marker, the HUD and the sky included.
+/// Without that, Bevy cannot prove two `&mut Visibility` queries do not overlap
+/// — an entity could in principle carry both markers — and panics with B0001.
 pub type BrushVisibility<'w, 's> = Query<
     'w,
     's,
@@ -24,6 +24,7 @@ pub type BrushVisibility<'w, 's> = Query<
         With<MapGeometry>,
         Without<DisplacementGeometry>,
         Without<HudText>,
+        Without<SkyBox>,
     ),
 >;
 
@@ -35,15 +36,23 @@ pub type TerrainVisibility<'w, 's> = Query<
         With<DisplacementGeometry>,
         Without<MapGeometry>,
         Without<HudText>,
+        Without<SkyBox>,
     ),
 >;
+
+/// The six sky quads. Toggling them off is the quickest way to tell a sky
+/// problem from a geometry problem — a "seam" that survives with the sky hidden
+/// was never in the sky.
+pub type SkyVisibility<'w, 's> =
+    Query<'w, 's, &'static mut Visibility, (With<SkyBox>, Without<HudText>)>;
 
 pub fn toggle_debug_views(
     keys: Res<ButtonInput<KeyCode>>,
     mut wireframe: ResMut<WireframeConfig>,
-    mut hud: Query<&mut Visibility, With<HudText>>,
+    mut hud: Query<&mut Visibility, (With<HudText>, Without<SkyBox>)>,
     mut geometry: BrushVisibility,
     mut terrain: TerrainVisibility,
+    mut sky: SkyVisibility,
 ) {
     fn toggled(current: Visibility) -> Visibility {
         match current {
@@ -72,6 +81,11 @@ pub fn toggle_debug_views(
     }
     if keys.just_pressed(KeyCode::F4) {
         for mut visibility in &mut terrain {
+            *visibility = toggled(*visibility);
+        }
+    }
+    if keys.just_pressed(KeyCode::F6) {
+        for mut visibility in &mut sky {
             *visibility = toggled(*visibility);
         }
     }

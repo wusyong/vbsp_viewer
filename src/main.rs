@@ -8,8 +8,8 @@
 //!
 //! Controls: WASD to move, Q/E down/up, hold Shift to sprint, click to capture
 //! the mouse and Escape to release. F1 toggles the overlay, F2 wireframe,
-//! F3 hides brush geometry, F4 terrain, and F5 swaps textured albedo for the
-//! per-material debug palette.
+//! F3 hides brush geometry, F4 terrain, F5 swaps textured albedo for the
+//! per-material debug palette, and F6 hides the sky.
 //!
 //! This file is app wiring only — argument parsing lives in [`cli`], map
 //! loading in [`map`], camera placement in [`viewpoint`], camera control in
@@ -31,7 +31,7 @@ use bevy::pbr::wireframe::WireframePlugin;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::window::PresentMode;
-use bevy_bsp::{MapInfo, SourceMaterialPlugin};
+use bevy_bsp::{MapInfo, SkyPlugin, SourceMaterialPlugin};
 use clap::Parser;
 
 fn main() -> AppExit {
@@ -66,6 +66,9 @@ fn main() -> AppExit {
         // Registers the material and embeds its shader; see
         // `bevy_bsp::material`.
         .add_plugins(SourceMaterialPlugin)
+        // Registers the sky material, embeds its shader, and keeps the sky box
+        // centred on the camera; see `bevy_bsp::sky`.
+        .add_plugins(SkyPlugin)
         .insert_resource(MapPath(path))
         .insert_resource(args)
         .init_resource::<MapInfo>()
