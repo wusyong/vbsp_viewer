@@ -51,15 +51,35 @@ fn main() -> std::process::ExitCode {
 
 /// Build the same surfaces the viewer does, so the atlas holds exactly the
 /// faces that will be drawn.
-fn build(bsp: &Bsp) -> Result<(Vec<Surface>, LightmapAtlas), Failure> {
+fn build(bsp: &Bsp) -> Result<(Vec<Surface>, LightmapAtlas, usize), Failure> {
     let world = geometry::build_worldspawn(bsp)?;
     let terrain = displacement::build_displacements(bsp)?;
+
+    // Measured before the atlas remap, while UVs are still face-local: a
+    // displacement's lightmap coordinates are a convex combination of its
+    // parent quad's four corner coordinates, so they *cannot* leave 0..1.
+    //
+    // Projecting the displaced position instead — the bug that made terrain
+    // shadows break into a grid — pushes them outside, where the remap's clamp
+    // can only flatten them into the border. So a non-zero count here is that
+    // bug returning.
+    let escaped = terrain
+        .surfaces
+        .iter()
+        .flat_map(|s| &s.vertices)
+        .filter(|v| {
+            v.lightmap_uv
+                .iter()
+                .any(|c| !(-1e-4..=1.0 + 1e-4).contains(c))
+        })
+        .count();
+
     let mut surfaces = world.surfaces;
     surfaces.extend(terrain.surfaces);
 
     let faces: Vec<u32> = lightmap::faces_of(&surfaces).collect();
     let atlas = lightmap::build(bsp, faces, Lighting::Ldr)?;
-    Ok((surfaces, atlas))
+    Ok((surfaces, atlas, escaped))
 }
 
 /// Vertices whose remapped UV left the atlas. The clamp in `remap` should make
@@ -79,7 +99,7 @@ fn uvs_outside_atlas(surfaces: &[Surface]) -> usize {
 fn dump(path: &Path, bmp: Option<&Path>) -> Result<bool, Failure> {
     let bsp = Bsp::open(path)?;
     let started = std::time::Instant::now();
-    let (mut surfaces, atlas) = build(&bsp)?;
+    let (mut surfaces, atlas, escaped) = build(&bsp)?;
     atlas.remap(&mut surfaces);
     let elapsed = started.elapsed();
 
@@ -100,13 +120,14 @@ fn dump(path: &Path, bmp: Option<&Path>) -> Result<bool, Failure> {
     println!("  built in       {:.0} ms", elapsed.as_secs_f32() * 1000.0);
 
     let outside = uvs_outside_atlas(&surfaces);
-    println!("  remapped UVs outside the atlas: {outside}");
+    println!("  remapped UVs outside the atlas:   {outside}");
+    println!("  terrain UVs outside their grid:   {escaped}");
 
     if let Some(out) = bmp {
         write_bmp(&atlas, out)?;
         println!("\n  wrote {}", out.display());
     }
-    Ok(outside == 0 && s.faces_bad_range == 0)
+    Ok(outside == 0 && s.faces_bad_range == 0 && escaped == 0)
 }
 
 fn sweep(dir: &Path) -> Result<bool, Failure> {
@@ -137,9 +158,9 @@ fn sweep(dir: &Path) -> Result<bool, Failure> {
             .unwrap_or_default();
 
         let outcome = Bsp::open(path).map_err(Failure::from).and_then(|bsp| {
-            let (mut surfaces, atlas) = build(&bsp)?;
+            let (mut surfaces, atlas, escaped) = build(&bsp)?;
             atlas.remap(&mut surfaces);
-            let outside = uvs_outside_atlas(&surfaces);
+            let outside = uvs_outside_atlas(&surfaces) + escaped;
             Ok((atlas, outside))
         });
 

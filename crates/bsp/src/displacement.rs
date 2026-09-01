@@ -15,10 +15,45 @@
 //! * the interpolation order, which is *not* a plain `(u, v)` bilerp
 //!   ([`build_displacements`]),
 //! * and the per-quad diagonal, which alternates ([`quad_splits_top_left`]).
+//!
+//! # Coordinates are interpolated from the corners, never projected
+//!
+//! A brush face's UVs come from projecting each vertex through the texinfo's
+//! affine axes. **Displacements do not work that way at all.**
+//! `CCoreDispInfo::CalcDispSurfCoords` ([builddisp.cpp:1547]) takes the parent
+//! quad's four *corner* coordinates and interpolates them across the same
+//! parametric grid the positions use — the identical `i`/`j` walk, for both
+//! `m_TexCoord` and `m_LuxelCoords`.
+//!
+//! Projecting the **displaced** position instead looks almost right and fails in
+//! a specific, visible way: a vertex pushed off the parent plane projects to a
+//! shifted coordinate, by an amount proportional to how far it moved.
+//! Neighbouring displacements then disagree along their shared edge, so baked
+//! shadows break at every displacement boundary and the terrain reads as a grid.
+//!
+//! The two corner sources are **not** the same:
+//!
+//! * **Texture** corners are the projection of the flat parent corners.
+//! * **Lightmap** corners come from the luxel grid's own dimensions
+//!   ([`corner_luxel_coords`]) and are never projected. This is not a
+//!   micro-optimisation of the same formula — it is a different quantity. On
+//!   `cp_badlands` face 13272 the parent ring spans 122 luxels of *world*
+//!   projection along U and 0.5 along V, while the face's own
+//!   `m_LightmapTextureSizeInLuxels` is `[1, 121]`: the grid axes are the
+//!   displacement's parametric ones, and which world direction each corresponds
+//!   to is decided by `LongestInU` and a possible swap inside
+//!   `CalcLuxelCoords`, not by any projection this code could redo. Projecting
+//!   put 5 533 of Badlands' 42 415 terrain vertices outside their own lightmap
+//!   rect, up to 60x past its edge.
+//!
+//! Taking the corners from the grid makes every vertex land inside the rect by
+//! construction, and makes a shared edge agree on both sides.
+//!
+//! [builddisp.cpp:1547]: ../../../source-sdk-2013/src/public/builddisp.cpp#L1547
 
 use crate::flags;
 use crate::geometry::{self, FaceChunk, Surface, SurfaceSet, Vertex};
-use crate::raw::{DEdge, DVertex, DispVert};
+use crate::raw::{DEdge, DFace, DVertex, DispVert};
 use crate::{Bsp, Result};
 
 /// Counters for a displacement build.
@@ -116,6 +151,56 @@ fn corner_ring(ring: [[f32; 3]; 4], start_position: [f32; 3]) -> [[f32; 3]; 4] {
         ring[(best + 2) % 4],
         ring[(best + 3) % 4],
     ]
+}
+
+/// A displacement's four corner lightmap coordinates.
+///
+/// Transcribed from `CCoreDispSurface::CalcLuxelCoords`
+/// ([builddisp.cpp:508-513]), which assigns them straight from the luxel grid's
+/// own dimensions with a half-luxel inset:
+///
+/// ```c
+/// m_LuxelCoords[(0+iOffset)%4].Init( 0.5f,            0.5f );
+/// m_LuxelCoords[(1+iOffset)%4].Init( 0.5f,            flVValue + 0.5 );
+/// m_LuxelCoords[(2+iOffset)%4].Init( flUValue + 0.5,  flVValue + 0.5 );
+/// m_LuxelCoords[(3+iOffset)%4].Init( flUValue + 0.5,  0.5f );
+/// ```
+///
+/// `flUValue`/`flVValue` are the face's `m_LightmapTextureSizeInLuxels`, and
+/// `iOffset` is the start-corner rotation [`corner_ring`] already applies — so
+/// the table maps onto the rotated ring in order.
+///
+/// Returned normalised by the sample grid, matching what the atlas packer
+/// expects from [`geometry::lightmap_uv`].
+///
+/// [builddisp.cpp:508-513]: ../../../source-sdk-2013/src/public/builddisp.cpp#L508
+fn corner_luxel_coords(face: &DFace) -> [[f32; 2]; 4] {
+    let (w, h) = (face.lightmap_width() as f32, face.lightmap_height() as f32);
+    let size = face.lightmap_texture_size_in_luxels;
+    let (u0, v0) = (0.5 / w, 0.5 / h);
+    let (u1, v1) = ((size[0] as f32 + 0.5) / w, (size[1] as f32 + 0.5) / h);
+    [[u0, v0], [u0, v1], [u1, v1], [u1, v0]]
+}
+
+/// Linear interpolation of a 2D coordinate.
+#[inline]
+fn lerp2(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+}
+
+/// A coordinate at grid parameters `(s, t)`, interpolated from the four rotated
+/// corner values.
+///
+/// The same two-stage walk as the positions — `s` along `c0 -> c1` and
+/// `c3 -> c2`, then `t` between those — so a coordinate and the vertex it
+/// belongs to always share their parameters. Both texture and lightmap
+/// coordinates go through here; see the module docs for where the corner values
+/// come from, which is *not* the same source for the two.
+#[inline]
+fn grid_coord(corners: &[[f32; 2]; 4], s: f32, t: f32) -> [f32; 2] {
+    let near = lerp2(corners[0], corners[1], s);
+    let far = lerp2(corners[3], corners[2], s);
+    lerp2(near, far, t)
 }
 
 #[inline]
@@ -270,10 +355,17 @@ pub fn build_displacements(bsp: &Bsp) -> Result<DispGeometry> {
         // then `j` crosses between those two points. The flat index is
         // `i * side + j`, matching `CCoreDispInfo::GenerateDispSurf`.
         grid.clear();
+        // Texture coordinates: project the **flat** parent corners, then
+        // interpolate. Lightmap coordinates: the corners of the luxel grid
+        // itself, which is a different rule entirely — see the module docs.
+        let corner_uv = corners.map(|c| geometry::texture_uv(c, texinfo, texdata));
+        let corner_lightmap_uv = corner_luxel_coords(face);
+
         for i in 0..side {
             let s = i as f32 / step;
             let near = lerp(corners[0], corners[1], s);
             let far = lerp(corners[3], corners[2], s);
+
             for j in 0..side {
                 let t = j as f32 / step;
                 let flat = lerp(near, far, t);
@@ -287,8 +379,8 @@ pub fn build_displacements(bsp: &Bsp) -> Result<DispGeometry> {
                     position,
                     // Filled in below, once the triangles are known.
                     normal: [0.0, 0.0, 1.0],
-                    uv: geometry::texture_uv(position, texinfo, texdata),
-                    lightmap_uv: geometry::lightmap_uv(position, texinfo, face),
+                    uv: grid_coord(&corner_uv, s, t),
+                    lightmap_uv: grid_coord(&corner_lightmap_uv, s, t),
                     // Stored 0..255 in the lump; the shader wants 0..1.
                     alpha: (dv.alpha / 255.0).clamp(0.0, 1.0),
                 });
@@ -452,6 +544,118 @@ mod tests {
         // The midpoint of a planar quad is the average of its corners.
         let mid = at(2, 2);
         assert!((mid[0] - 32.0).abs() < 1e-4 && (mid[1] - 32.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_grid_reproduces_its_corner_values_exactly() {
+        // A corner vertex must get its corner's coordinate, not something a
+        // half-texel off, or every displacement's lighting is shifted.
+        let corners = [[0.1, 0.2], [0.1, 0.8], [0.9, 0.8], [0.9, 0.2]];
+        assert_eq!(grid_coord(&corners, 0.0, 0.0), corners[0]);
+        assert_eq!(grid_coord(&corners, 1.0, 0.0), corners[1]);
+        assert_eq!(grid_coord(&corners, 1.0, 1.0), corners[2]);
+        assert_eq!(grid_coord(&corners, 0.0, 1.0), corners[3]);
+    }
+
+    #[test]
+    fn an_edge_depends_only_on_that_edges_corners() {
+        // This is what makes a seam continuous, and it is the property the
+        // grid-shaped shadows violated. Two displacements sharing an edge agree
+        // on that edge's two corners but not on the opposite two, so the
+        // coordinates along it must ignore the far pair.
+        //
+        // "Ignore" holds mathematically but not bit-exactly: `lerp` computes
+        // `a + (b - a) * t`, which at `t = 1` is not identical to `b` once the
+        // endpoints are far apart. The deliberately absurd far corners below
+        // make that rounding as large as it can get — about 2e-7, or 1e-5 of a
+        // luxel on the narrowest grid TF2 ships. Hence a tolerance rather than
+        // equality; the bug this guards against moved coordinates by up to 60
+        // whole rect widths.
+        const TOLERANCE: f32 = 1e-6;
+        let close = |a: [f32; 2], b: [f32; 2]| {
+            (a[0] - b[0]).abs() < TOLERANCE && (a[1] - b[1]).abs() < TOLERANCE
+        };
+
+        let corners = [[0.1, 0.2], [0.1, 0.8], [0.9, 0.8], [0.9, 0.2]];
+
+        // Same near edge (0, 1), wildly different far edge (3, 2).
+        let neighbour = [[0.1, 0.2], [0.1, 0.8], [-7.0, 4.0], [3.0, -5.0]];
+        for step in 0..=8 {
+            let s = step as f32 / 8.0;
+            let (a, b) = (
+                grid_coord(&corners, s, 0.0),
+                grid_coord(&neighbour, s, 0.0),
+            );
+            assert!(close(a, b), "t = 0 edge moved: {a:?} vs {b:?} at s = {s}");
+        }
+
+        // ...and symmetrically, the far edge ignores the near corners.
+        let neighbour = [[6.0, 6.0], [-2.0, 9.0], [0.9, 0.8], [0.9, 0.2]];
+        for step in 0..=8 {
+            let s = step as f32 / 8.0;
+            let (a, b) = (
+                grid_coord(&corners, s, 1.0),
+                grid_coord(&neighbour, s, 1.0),
+            );
+            assert!(close(a, b), "t = 1 edge moved: {a:?} vs {b:?} at s = {s}");
+        }
+
+        // With the values a real map actually holds — all four corners inside
+        // 0..1 — the same comparison passes far more tightly.
+        let realistic = [[0.1, 0.2], [0.1, 0.8], [0.42, 0.61], [0.37, 0.05]];
+        for step in 0..=8 {
+            let s = step as f32 / 8.0;
+            let (a, b) = (
+                grid_coord(&corners, s, 0.0),
+                grid_coord(&realistic, s, 0.0),
+            );
+            assert_eq!(a, b, "realistic corners should agree exactly at s = {s}");
+        }
+    }
+
+    #[test]
+    fn lightmap_corners_come_from_the_luxel_grid_not_a_projection() {
+        // `cp_badlands` face 13272: a 2 x 122 luxel grid whose world projection
+        // along U spans 122 luxels and along V spans 0.5 — the case that proved
+        // no projection could produce these numbers.
+        let mut face: DFace = bytemuck::Zeroable::zeroed();
+        face.lightmap_texture_size_in_luxels = [1, 121];
+        assert_eq!(face.lightmap_width(), 2);
+        assert_eq!(face.lightmap_height(), 122);
+
+        let corners = corner_luxel_coords(&face);
+        // Half a luxel in from each edge of the grid, per `CalcLuxelCoords`.
+        assert_eq!(corners[0], [0.5 / 2.0, 0.5 / 122.0]);
+        assert_eq!(corners[1], [0.5 / 2.0, 121.5 / 122.0]);
+        assert_eq!(corners[2], [1.5 / 2.0, 121.5 / 122.0]);
+        assert_eq!(corners[3], [1.5 / 2.0, 0.5 / 122.0]);
+
+        // Every grid coordinate is then a convex combination of those, so it
+        // cannot leave 0..1 — which is the invariant `lmdump` now enforces.
+        for i in 0..=8 {
+            for j in 0..=8 {
+                let uv = grid_coord(&corners, i as f32 / 8.0, j as f32 / 8.0);
+                assert!(
+                    uv.iter().all(|c| (0.0..=1.0).contains(c)),
+                    "grid coord {uv:?} left the rect"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lerp2_matches_the_position_lerp_it_runs_alongside() {
+        // The two must stay in step: a coordinate is interpolated with the same
+        // parameter as the position it belongs to, so any divergence in the
+        // formulas would slide the texture across the surface.
+        let (a3, b3) = ([0.0, 10.0, 100.0], [1.0, 20.0, 200.0]);
+        let (a2, b2) = ([0.0, 10.0], [1.0, 20.0]);
+        for step in 0..=4 {
+            let t = step as f32 / 4.0;
+            let p = lerp(a3, b3, t);
+            let c = lerp2(a2, b2, t);
+            assert_eq!([p[0], p[1]], c, "position and coordinate lerps differ");
+        }
     }
 
     #[test]

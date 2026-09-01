@@ -217,7 +217,7 @@ Most TF2 maps put all ground and cliffs in displacements; Badlands has 1191 of t
   alpha = disp_verts[...].m_flAlpha   // 0..255 blend weight for $basetexture2
   ```
 - Triangulate the grid following `builddisp.cpp` — **alternate the quad diagonal by `(i + j)` parity**, not a fixed diagonal, or terrain silhouettes will visibly differ from the real game.
-- Texture and lightmap UVs come from the parent face's `texinfo`, evaluated at the **final displaced** position (this is what the engine does).
+- ~~Texture and lightmap UVs come from the parent face's `texinfo`, evaluated at the **final displaced** position (this is what the engine does).~~ **Wrong on both counts** — it is not what the engine does, and it produced grid-shaped shadow seams across all terrain. See the M8 findings addendum.
 - Carry `alpha` into `ATTRIBUTE_COLOR` (or a spare UV channel) for the M8 two-texture blend.
 - `CDispTri.m_uiTags` — `DISPTRI_TAG_REMOVE` triangles should be skipped.
 
@@ -443,6 +443,67 @@ Available and confirmed on crates.io. The published `vbsp` 0.9.1 / `vtf` 0.4.1 /
 
 ---
 
+### M8 findings
+
+Phase 1's goal is met: `cargo run -- --map cp_badlands` opens a window showing Badlands with brush geometry, displacement terrain, VTF textures and baked lightmaps, navigable with a free-fly camera. Upward, 2fort, Turbine and cp_cargo all render recognisably as themselves.
+
+**Textures go to the GPU compressed, as the plan wanted.** `cp_badlands`: 57 textures, **all 57 by BC block passthrough, 0 CPU-decoded, 31.9 MiB** — the same data the real game uploads, where RGBA8 would have cost roughly eight times that. Across the maps checked, only 1–3 textures per map take the CPU path, and they are the rare uncompressed formats (`BGR888`, `ABGR8888`, `UV88`, `RGBA16161616F`). `BGRX8888` and `UVLX8888` are deliberately excluded from passthrough: their fourth channel is undefined padding, and uploading it as alpha would make a surface randomly transparent.
+
+**Only one shader was needed.** `LightmappedGeneric` is 43 772 of 47 694 material references and falls out of Bevy's `StandardMaterial` for free — `$basetexture` becomes `base_color_texture`, and the M5 lightmap arrives through Bevy's own `Lightmap` component. The single thing that does not fit is `WorldVertexTransition` (2 073 references), so that is all `source_material.wgsl` does: an `ExtendedMaterial` fragment that mixes `$basetexture2` by vertex alpha. Source's `OVERBRIGHT` of 2 is now folded back into `lightmap_exposure`, where it belongs once a real texture's reflectance is there to cancel it.
+
+**The blend weight rides vertex *alpha*, with RGB pinned to 1.** Bevy's PBR path does `base_color *= in.color`, so anything but 1 in RGB tints every surface. And the weight is read from `in.color.a` rather than from `pbr_input.material.base_color.a`, because by the time the standard path returns, that has already been multiplied by the material and texture alpha.
+
+**⚠️ Two bugs that only *running* the renderer could find, both invisible to tests and to release builds.**
+
+*One:* wgpu rejects a sampler with `anisotropy_clamp != 1` unless **every** filter mode is linear, and `mipmap_filter` was `Nearest` for single-mip textures:
+
+```text
+In Device::create_sampler
+  Invalid filter mode for mipmapFilter: Nearest.
+  When anistropic clamp is not 1 (it is 8), all filter modes must be linear.
+```
+
+Badlands, Upward and 2fort all rendered perfectly, because none of them happens to use a no-mip texture. Rendering actual maps found it: **7 failures in the first 24**.
+
+*Two:* `Image::new` carries a `debug_assert_eq!` that `data.len()` is exactly **one** mip level, so passing a whole chain panics under `cargo run` while release compiles the check away. It hid twice over: the assertion is skipped for BC formats (`pixel_size()` returns `Err` when a block is larger than 1×1), so only the uncompressed passthrough formats tripped it — and every screenshot so far had been taken from a `--release` build.
+
+Neither of Bevy's convenience constructors can do this job: `Image::new` takes no mip count, and `from_dynamic` wants already-decoded RGBA, which would discard both the compression and the mips. Bevy's own mipmapped loaders build the image exactly as this does — `bevy_image/src/dds.rs:78` and `ktx2.rs:263-278` both set `mip_level_count` and `data` directly. **But removing a panic is not the same as adding a check**, so `gpu_bytes` now computes what wgpu expects for a chain from the *format's own* block description and refuses the upload on mismatch. A test asserts that formula agrees with Valve's surface sizes on every level of four chain shapes across all five passthrough formats — two independent derivations agreeing, rather than one assumption restated.
+
+**"Rendered without errors" is not "showed something".** Rendering every map produced 233 successes and 0 errors — and a spot check found `ctf_turbine`'s frame essentially **empty**. The map was built and lit correctly (101 materials, 16 065 tris, 0 missing); the automatic camera frames a map *from outside*, and Turbine is fully enclosed, so it was looking at culled backfaces. Measuring the fraction of each frame that is not the clear colour turned the gate into a real claim: **230 of 233 maps at a mean 66.5% coverage, and exactly 3 near-empty** — `ctf_turbine`, `vsh_outburst`, `koth_dryfield`, all enclosed.
+
+So the default viewpoint now **starts at a player spawn**, facing where the mapper pointed it — `info_player_teamspawn`'s `angles`, falling back to `info_player_start`, then to the old outside framing. A spawn is inside the playable space by definition, which is the guarantee a bounding box cannot give, and the spawn's own yaw beats aiming at the map centre, which just puts the camera's nose against whichever wall lies that way. 2fort now opens in the BLU spawn room looking out through the glass door, which is what a player sees when the map starts.
+
+**Only used materials are loaded.** A map's TEXDATA list includes materials no visible face uses — `TOOLS/TOOLSTRIGGER`, `TOOLSHINT`, `TOOLSAREAPORTAL` — whose faces the geometry builder already drops. On `cp_badlands` that is **37 of 151 materials**, and loading them cost 57 needless textures and 14 MiB. Passing the set of texdatas the geometry actually produced cut 151→94 materials and 45.9→31.9 MiB, and made the translucent count honest (70→16: most of those "translucent" materials were `$translucent 1` tool textures).
+
+**Verification, stated precisely:**
+
+- **35 maps rendered with the final camera, 0 failures**, then stopped at the user's direction; sweeps are narrowed to ~10 maps by default from here.
+- **233 maps rendered, 0 failures** with the previous camera and the sampler fix in place — this is what caught both render bugs and the empty-frame problem.
+- **Coverage measured over all 233 frames**: mean 66.5%, 3 near-empty, all three since fixed and individually re-verified.
+- `cargo run` (debug, with `debug_assert`s live) loads 2fort, Badlands and cp_cargo cleanly.
+- 112 tests, clippy clean.
+
+Deliberately left for phase 2, as scoped: static props, the 3D skybox as anything but geometry, real water and cubemap reflections, `$bumpmap`/phong, and decals/overlays.
+
+- Water has no `$basetexture` to draw (547 of the 562 materials with none), so it renders as a provisional translucent teal rather than grey.
+- A material that resolves to no VMT is painted magenta, standing in for the engine's missing-material checkerboard, so it is obvious rather than silently black.
+- `--no-textures` keeps the M5 view (flat palette, real lighting) and `--no-lightmap` the M3/M4 one, so each layer can still be judged alone.
+
+### Addendum — displacement coordinates (found after M8)
+
+The terrain shadows were breaking at every displacement boundary, so the terrain read as a grid. **The plan's instruction above was wrong, and I had followed it.**
+
+`CCoreDispInfo::CalcDispSurfCoords` ([builddisp.cpp:1547](../../source-sdk-2013/src/public/builddisp.cpp#L1547)) does not project anything. It takes the parent quad's four **corner** coordinates and interpolates them across the displacement's parametric grid — the same `i`/`j` walk as the positions, for `m_TexCoord` and `m_LuxelCoords` alike. Projecting the *displaced* position shifts each vertex's coordinate in proportion to how far it moved off the parent plane, so two displacements sharing an edge disagree there.
+
+And the two corner sources are **different quantities**, which is the part that took measuring to see:
+
+- **Texture** corners are the projection of the flat parent corners.
+- **Lightmap** corners are assigned straight from the luxel grid's own dimensions — `CCoreDispSurface::CalcLuxelCoords` ([builddisp.cpp:508](../../source-sdk-2013/src/public/builddisp.cpp#L508)) writes `(0.5, 0.5)`, `(0.5, V+0.5)`, `(U+0.5, V+0.5)`, `(U+0.5, 0.5)` onto the rotated corner ring, where `U`/`V` are the face's `m_LightmapTextureSizeInLuxels`. No projection is involved, and none *could* be: on `cp_badlands` face 13272 the parent ring spans 122 luxels of world projection along U and 0.5 along V, while the face's own size is `[1, 121]`. The luxel axes are the displacement's parametric ones, and which world direction each maps to is decided by `LongestInU` and a possible swap inside `CalcLuxelCoords`.
+
+**Measured:** projecting put **5 533 of Badlands' 42 415 terrain vertices outside their own lightmap rect**, by up to 60× the rect's width, where the atlas remap could only clamp them into the border — which is what flattened the lighting into bands and broke it at seams. Interpolating from the grid corners puts every vertex inside by construction: **0 outside, on all 10 maps checked**, and `lmdump` now fails if that count is ever non-zero again.
+
+The lesson worth keeping: the clamp I added in M5 for "displaced vertices project slightly outside their parent's extent" was not a robustness measure, it was a symptom. A clamp that fires on real data is evidence of a wrong coordinate, not a safety net.
+
 ## Verification
 
 **Automated:**
@@ -453,6 +514,12 @@ cargo run -p bsp --example lmdump   -- --all-maps "<tf dir>"   # lightmap atlas 
 cargo run -p vfs --example vfsls    -- --all-maps               # resolve every map's materials
 cargo run -p vtf --example vtfdump  -- --all-textures           # decode every VTF in the game
 cargo run -p vtf --example vtfdump  -- --all-maps               # ...and every VTF the maps use
+
+# And the only check that exercises the whole stack — VFS, texture upload,
+# shader pipeline, lightmap atlas, geometry — because the renderer does the
+# work rather than a CLI standing in for it. Narrowed to ~10 maps by default;
+# see the M8 findings on why "no errors" is not the same as "showed something".
+cargo run --release -- --map <name> --screenshot out.png
 ```
 The all-maps sweep is the highest-value test in phase 1 — it catches version drift, `dleaf_t` v0/v1 branching, unusual displacement powers, and community-map edge cases in one command.
 

@@ -413,7 +413,19 @@ fn load_map(
     // lot of a TF2 map. Each is a BSP model placed at the entity's origin, and
     // finding them needs the ENTITIES lump's KeyValues — which is why this
     // waited for the `vfs` crate rather than shipping with M2.
-    let mut brush_models = match brush_entity_models(&bsp) {
+    let entities = match bsp
+        .entities_str()
+        .map_err(|e| e.to_string())
+        .and_then(|text| vfs::entities::parse(text).map_err(|e| e.to_string()))
+    {
+        Ok(entities) => entities,
+        Err(e) => {
+            error!("failed to parse the ENTITIES lump: {e}");
+            Vec::new()
+        }
+    };
+
+    let mut brush_models = match brush_entity_models(&bsp, &entities) {
         Ok(models) => models,
         Err(e) => {
             // Worth continuing without: the world still renders, and missing
@@ -550,7 +562,7 @@ fn load_map(
         warn!("no texture at {missing}");
     }
 
-    let start = default_viewpoint(&world);
+    let start = default_viewpoint(&world, &entities);
     if let Ok((mut transform, mut fly)) = camera.single_mut() {
         transform.translation = args
             .pos
@@ -598,12 +610,14 @@ struct BrushEntity {
 /// Model 0 is worldspawn and is excluded by `vfs::entities::brush_entities`.
 /// A model index the MODELS lump does not have is skipped rather than failing
 /// the map — one broken entity should not cost the whole level.
-fn brush_entity_models(bsp: &bsp::Bsp) -> Result<Vec<BrushEntity>, Box<dyn std::error::Error>> {
-    let entities = vfs::entities::parse(bsp.entities_str()?)?;
+fn brush_entity_models(
+    bsp: &bsp::Bsp,
+    entities: &[vfs::Entity],
+) -> Result<Vec<BrushEntity>, Box<dyn std::error::Error>> {
     let model_count = bsp.models()?.len();
 
     let mut out = Vec::new();
-    for (model, entity) in vfs::entities::brush_entities(&entities) {
+    for (model, entity) in vfs::entities::brush_entities(entities) {
         if model >= model_count {
             warn!(
                 "{} references model *{model}, but the map has {model_count}",
@@ -645,6 +659,62 @@ struct Viewpoint {
     pitch: f32,
 }
 
+/// Eye height above a spawn point's origin, in Source units. A TF2 player is
+/// 72 units tall and the view sits near the top of that.
+const EYE_HEIGHT: f32 = 64.0;
+
+/// Where to put the camera when `--pos`/`--angles` are not given.
+///
+/// **A player spawn is used when the map has one.** Framing a map from outside
+/// only works for open maps: rendering all 233 showed three — `ctf_turbine`,
+/// `vsh_outburst`, `koth_dryfield` — as essentially empty frames, because they
+/// are fully enclosed and from outside there is nothing to see but culled
+/// backfaces. A spawn point is inside the playable space by definition, which
+/// is exactly the guarantee the bounding box cannot give.
+fn default_viewpoint(geometry: &ModelGeometry, entities: &[vfs::Entity]) -> Viewpoint {
+    if let Some(spawn) = player_spawn(entities) {
+        let origin = spawn.origin();
+        // Face where the mapper pointed the spawn — `angles` is
+        // `pitch yaw roll` in degrees, and a spawn faces out of its room into
+        // the level. Aiming at the map centre instead puts the camera's nose
+        // against whichever wall happens to lie that way.
+        let yaw = match spawn.vector("angles") {
+            Some(angles) => angles[1].to_radians(),
+            None => {
+                let centre = trimmed_centre(geometry);
+                (centre[1] - origin[1]).atan2(centre[0] - origin[0])
+            }
+        };
+        return Viewpoint {
+            position: [origin[0], origin[1], origin[2] + EYE_HEIGHT],
+            yaw: source_yaw_to_bevy(yaw),
+            pitch: -0.09,
+        };
+    }
+    frame_from_outside(geometry)
+}
+
+/// The first player spawn, preferring a team spawn over a generic start.
+fn player_spawn(entities: &[vfs::Entity]) -> Option<&vfs::Entity> {
+    [
+        "info_player_teamspawn",
+        "info_player_start",
+        "info_observer_point",
+    ]
+    .iter()
+    .find_map(|classname| {
+        entities
+            .iter()
+            .find(|e| e.classname.eq_ignore_ascii_case(classname))
+    })
+}
+
+/// Source measures yaw about +Z from +X; the fly camera measures it about +Y
+/// in Bevy space, where Source's +X is -Z. Hence the quarter turn.
+fn source_yaw_to_bevy(yaw: f32) -> f32 {
+    yaw - std::f32::consts::FRAC_PI_2
+}
+
 /// Frame the whole map from outside it.
 ///
 /// Two traps make the obvious approaches fail:
@@ -659,17 +729,16 @@ struct Viewpoint {
 ///
 /// So: take trimmed bounds, then stand back along a diagonal and look at their
 /// centre, at a distance scaled to the map's horizontal size.
-fn default_viewpoint(geometry: &ModelGeometry) -> Viewpoint {
+/// The 2nd and 98th percentile of vertex positions per axis.
+///
+/// Percentiles rather than the MODELS-lump box, which includes 3D-skybox
+/// brushes and bottomless pits.
+fn trimmed_bounds(geometry: &ModelGeometry) -> Option<([f32; 3], [f32; 3])> {
     let total: usize = geometry.surfaces.iter().map(|s| s.vertices.len()).sum();
     if total == 0 {
-        return Viewpoint {
-            position: [0.0; 3],
-            yaw: 0.0,
-            pitch: 0.0,
-        };
+        return None;
     }
 
-    // Trimmed extents per axis: the 2nd and 98th percentiles.
     let mut lo = [0.0f32; 3];
     let mut hi = [0.0f32; 3];
     let mut values = Vec::with_capacity(total);
@@ -691,6 +760,29 @@ fn default_viewpoint(geometry: &ModelGeometry) -> Viewpoint {
         lo[axis] = at(&mut values, 0.02);
         hi[axis] = at(&mut values, 0.98);
     }
+    Some((lo, hi))
+}
+
+/// Middle of the trimmed bounds, or the world origin for empty geometry.
+fn trimmed_centre(geometry: &ModelGeometry) -> [f32; 3] {
+    let Some((lo, hi)) = trimmed_bounds(geometry) else {
+        return [0.0; 3];
+    };
+    [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ]
+}
+
+fn frame_from_outside(geometry: &ModelGeometry) -> Viewpoint {
+    let Some((lo, hi)) = trimmed_bounds(geometry) else {
+        return Viewpoint {
+            position: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+    };
 
     let centre = [
         (lo[0] + hi[0]) * 0.5,
