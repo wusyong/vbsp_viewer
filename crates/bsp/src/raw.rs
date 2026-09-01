@@ -223,16 +223,83 @@ impl DLeaf {
     }
 }
 
-/// `dleaf_t` at lump version 0: [`DLeaf`] plus a trailing 24-byte
-/// `CompressedLightCube`. Present only in pre-2006 maps.
+/// `dleaf_t` at lump version 0 (`dleaf_version_0_t`, `bspfile.h:799`):
+/// [`DLeaf`]'s fields plus an inline 24-byte `CompressedLightCube`. Present
+/// only in pre-2006 maps; the SDK's `dm_lockdown.bsp` is the one available
+/// sample.
+///
+/// **The fields are spelled out rather than nesting [`DLeaf`], because the
+/// light cube does not start where a nested struct would put it.** `DLeaf` is
+/// 32 bytes *including two trailing pad bytes*, but in C the cube follows
+/// `leafWaterDataID` immediately: `ColorRGBExp32` is four `u8`-sized members,
+/// so `CompressedLightCube` has alignment 1 and no padding can precede it. It
+/// begins at byte **30**, and the two pad bytes land at the *end* instead.
+///
+/// Both layouts are 56 bytes, so neither [`assert_size`] nor a stride check can
+/// tell them apart — which is why [`OFFSET_OF_AMBIENT_LIGHTING`] is asserted
+/// separately. Measured on `dm_lockdown.bsp`'s 2725 leaves: bytes 30..32 hold
+/// 1950 distinct values, while bytes 54..56 are `0x0000` on every single leaf.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct DLeafV0 {
-    pub leaf: DLeaf,
+    pub contents: i32,
+    pub cluster: i16,
+    /// Bitfield: `area:9`, `flags:7`. Use [`DLeafV0::area`] / [`DLeafV0::flags`].
+    area_flags: u16,
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub firstleafface: u16,
+    pub numleaffaces: u16,
+    pub firstleafbrush: u16,
+    pub numleafbrushes: u16,
+    /// -1 when the leaf is not in water.
+    pub leaf_water_data_id: i16,
     /// `CompressedLightCube`: six `ColorRGBExp32`, one per axis direction.
+    /// Starts at byte 30 — see the type docs.
     pub ambient_lighting: [ColorRgbExp32; 6],
+    /// Trailing padding to the struct's 4-byte alignment. Always zero in the
+    /// maps measured.
+    pub _pad: [u8; 2],
 }
 assert_size!(DLeafV0, 56);
+
+/// Where the v0 light cube begins. Asserted below; see [`DLeafV0`].
+pub const OFFSET_OF_AMBIENT_LIGHTING: usize = 30;
+
+const _: () = assert!(
+    ::core::mem::offset_of!(DLeafV0, ambient_lighting) == OFFSET_OF_AMBIENT_LIGHTING,
+    "the v0 light cube follows leafWaterDataID with no padding; nesting DLeaf      would push it to 32 and silently shift every channel",
+);
+
+impl DLeafV0 {
+    /// The fields this layout shares with [`DLeaf`], for code that does not
+    /// care which lump version it is reading.
+    pub fn leaf(&self) -> DLeaf {
+        DLeaf {
+            contents: self.contents,
+            cluster: self.cluster,
+            area_flags: self.area_flags,
+            mins: self.mins,
+            maxs: self.maxs,
+            firstleafface: self.firstleafface,
+            numleaffaces: self.numleaffaces,
+            firstleafbrush: self.firstleafbrush,
+            numleafbrushes: self.numleafbrushes,
+            leaf_water_data_id: self.leaf_water_data_id,
+            _pad: 0,
+        }
+    }
+
+    #[inline]
+    pub fn area(&self) -> u16 {
+        self.area_flags & 0x01FF
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u16 {
+        self.area_flags >> 9
+    }
+}
 
 /// `dmodel_t`. Model 0 is worldspawn; 1.. are brush entities, referenced by
 /// an entity's `model "*N"` key.
@@ -423,3 +490,65 @@ pub struct DGameLump {
     pub filelen: i32,
 }
 assert_size!(DGameLump, 16);
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v0 leaf's light cube starts at byte 30, so a cast must read it there.
+    ///
+    /// Nesting [`DLeaf`] instead puts it at 32: still 56 bytes total, still an
+    /// exact stride divisor, but every channel shifted two bytes and the last
+    /// two read from the trailing padding. Only an offset check catches that,
+    /// which is what this test and the `offset_of!` assertion are for.
+    #[test]
+    fn the_v0_light_cube_starts_at_byte_30_not_32() {
+        let mut bytes = [0u8; 56];
+        // leafWaterDataID = -1, the last field before the cube.
+        bytes[28..30].copy_from_slice(&(-1i16).to_le_bytes());
+        // Fill the cube with a recognisable ramp at its real offset.
+        for (i, b) in bytes[30..54].iter_mut().enumerate() {
+            *b = i as u8 + 1;
+        }
+
+        let leaf: &DLeafV0 = bytemuck::from_bytes(&bytes);
+
+        assert_eq!(leaf.leaf_water_data_id, -1);
+        // First sample is bytes 30..34, last is 50..54.
+        assert_eq!(
+            (
+                leaf.ambient_lighting[0].r,
+                leaf.ambient_lighting[0].g,
+                leaf.ambient_lighting[0].b,
+                leaf.ambient_lighting[0].exponent,
+            ),
+            (1, 2, 3, 4),
+        );
+        assert_eq!(leaf.ambient_lighting[5].exponent, 24);
+        // The two spare bytes are at the end, where dm_lockdown's are zero.
+        assert_eq!(leaf._pad, [0, 0]);
+    }
+
+    /// The shared fields must land at the same offsets in both lump versions,
+    /// or `leaf()` would be reinterpreting rather than copying.
+    #[test]
+    fn both_leaf_versions_agree_on_the_fields_they_share() {
+        let mut bytes = [0u8; 56];
+        bytes[0..4].copy_from_slice(&1i32.to_le_bytes()); // contents
+        bytes[4..6].copy_from_slice(&7i16.to_le_bytes()); // cluster
+        // area = 300 (9 bits), flags = 5 (7 bits) -> the packed word.
+        bytes[6..8].copy_from_slice(&(300u16 | (5u16 << 9)).to_le_bytes());
+        bytes[20..22].copy_from_slice(&11u16.to_le_bytes()); // firstleafface
+        bytes[28..30].copy_from_slice(&(-1i16).to_le_bytes());
+
+        let v0: &DLeafV0 = bytemuck::from_bytes(&bytes);
+        let v1: &DLeaf = bytemuck::from_bytes(&bytes[..32]);
+
+        assert_eq!(v0.leaf().contents, v1.contents);
+        assert_eq!(v0.leaf().cluster, v1.cluster);
+        assert_eq!(v0.leaf().firstleafface, v1.firstleafface);
+        assert_eq!((v0.area(), v0.flags()), (300, 5));
+        assert_eq!((v0.area(), v0.flags()), (v1.area(), v1.flags()));
+    }
+}
