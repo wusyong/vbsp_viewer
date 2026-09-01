@@ -57,7 +57,7 @@ M1 sampled `sprp` v10 and the plan assumed it throughout. Across all 233 maps:
 | 6 | **64** | 37 | 36 150 |
 | 5 | **60** | 1 | 179 |
 
-Every stride divides exactly with **0 leftover bytes** — this table is M13's acceptance test, the same way the struct-size table was M1's. Note v7 measures the same 72 bytes as v10; whether the *fields* match, or v7 is 68 bytes plus padding, must be checked against `StaticPropLumpV6_t`/V10 before its tail fields are trusted. It is one map and 0.15% of props, so failing closed there is acceptable.
+Every stride divides exactly with **0 leftover bytes** — this table is M12's acceptance test, the same way the struct-size table was M1's. Note v7 measures the same 72 bytes as v10; whether the *fields* match, or v7 is 68 bytes plus padding, must be checked against `StaticPropLumpV6_t`/V10 before its tail fields are trusted. It is one map and 0.15% of props, so failing closed there is acceptable.
 
 **MDL versions of the models maps actually reference** — sampled over 20 maps, 1 236 unique models:
 
@@ -111,9 +111,9 @@ One new crate; the existing four grow. Phase 1's split holds — nothing below `
 
 ```
 crates/
-  bsp/      + gamelump.rs   (per-lump LZMA, sprp v5/6/7/10, dprp)
-            + ambient.rs    (leaf ambient cube lookup)
-            + cluster.rs    (leaf/cluster partition, for the 3D skybox)
+  bsp/      + gamelump.rs   (M12: per-lump LZMA, sprp v5/6/7/10, dprp)
+            + ambient.rs    (M15: leaf ambient cube lookup)
+            + cluster.rs    (M11: leaf/cluster partition, for the 3D skybox)
             examples/propdump.rs
   mdl/      NEW — studiohdr / VVD / VTX, engine-free
             examples/mdldump.rs
@@ -158,7 +158,19 @@ Same rule as Phase 1: each ends in something observable, and a failing verificat
 
 **Verify:** `cp_badlands` and `pl_upward` show distant mesas and structures with correct parallax; the trimmed-bounds camera no longer has skybox brushes in range; each of the 5 non-16 scales and the 4 multi-camera maps renders sanely.
 
-### M12 — MDL/VVD/VTX reader (`crates/mdl`)
+### M12 — Game lump reader (`bsp::gamelump`)
+
+**Its own milestone rather than part of the prop work, because M13's acceptance gate depends on it.** The only place a map states *which models it references* is the `sprp` dictionary, so "parse every model the 233 maps reference" cannot run until this exists. It is also the piece with the highest chance of a silent byte-offset bug, and Phase 1's repeated lesson was to isolate those behind their own CLI rather than bundle them into a milestone whose gate is about something else.
+
+- The game lump directory: `int count` followed by `dgamelump_t[count]`, with the terminating zero-id entry ignored (M1 already found that one).
+- **Per-lump LZMA.** `flags & GAMELUMPFLAG_COMPRESSED` selects it; the body is the same 17-byte Valve header `crates/bsp/src/lump.rs` already inflates, so reuse that path rather than writing a second one.
+- **⚠️ The compressed span comes from the next entry's `fileofs`, not from `filelen`** — which holds the *uncompressed* size when the flag is set. For the last real entry, the span ends at the end of `LUMP_GAME_LUMP`. Getting this wrong reads far past the data; see the finding above.
+- `sprp` v5/v6/v7/v10: dictionary (`char name[128]`) → leaf array (`u16`) → prop array, at the strides in the table above. Version-branch on the *record size*, and refuse an unknown version rather than guessing a layout.
+- Expose the prop list and the model-name dictionary; **placement, instancing and materials are M14's**.
+
+**Verify:** `propdump --all-maps` reads all 233 maps — **353 116 props and 8 584 unique model paths** — with 0 lump errors, **0 leftover bytes on every stride**, and 0 out-of-range dictionary indices. The version histogram must come out 193/1/37/1 for v10/v7/v6/v5, and the compressed/uncompressed split 177/56, so a reader that silently handles only one path fails the gate rather than passing it quietly.
+
+### M13 — MDL/VVD/VTX reader (`crates/mdl`)
 
 Formats only — no Bevy, no placement. Build `mdldump` first; the same decision paid for itself in M1 and M7.
 
@@ -169,19 +181,18 @@ Formats only — no Bevy, no placement. Build `mdldump` first; the same decision
 - **Checksums:** `studiohdr_t.checksum`, `vertexFileHeader_t.checksum` and `FileHeader_t.checkSum` must agree — a mismatched trio means stale files and scrambled geometry, so verify rather than trust.
 - LOD 0 only for Phase 2; keep the LOD index a parameter.
 
-**Verify:** `mdldump --all-models` parses every MDL/VVD/VTX triple in the VPKs (16 215 sets) with 0 failures; `--all-maps` does the same for every model the 233 maps reference with pakfiles mounted. Assert every index is in range and every mesh's triangle count matches its strip headers.
+**Verify:** `mdldump --all-models` parses every MDL/VVD/VTX triple in the VPKs (16 215 sets) with 0 failures; `--all-maps` does the same for every model the 233 maps reference with pakfiles mounted — **the model list comes from M12's `sprp` dictionary**, which is why that milestone comes first. Assert every index is in range and every mesh's triangle count matches its strip headers.
 
-### M13 — Static props placed in the world
+### M14 — Static props placed in the world
 
-- `bsp::gamelump`: the game lump directory, **per-lump LZMA with the span taken from the next entry's offset**, and `sprp` v5/v6/v7/v10 at the strides in the table above.
-- Dictionary (`char name[128]`) → leaf array → prop array. Per prop: `m_Origin`, `m_Angles` (**Source `QAngle` is pitch-yaw-roll**, not roll-pitch-yaw), `m_PropType` into the dictionary, `m_Skin`, `m_FadeMinDist`/`m_FadeMaxDist`, `m_LightingOrigin`, `m_Flags`.
+- Per prop, from M12's parsed records: `m_Origin`, `m_Angles` (**Source `QAngle` is pitch-yaw-roll**, not roll-pitch-yaw), `m_PropType` into the dictionary, `m_Skin`, `m_FadeMinDist`/`m_FadeMaxDist`, `m_LightingOrigin`, `m_Flags`.
 - **Instance, don't duplicate.** 4 383 props on one map over far fewer unique models: one mesh and one material per model, many transforms.
 - Prop materials are `VertexLitGeneric` — `$basetexture`, `$bumpmap`, `$phong`. `$bumpmap` maps onto `StandardMaterial::normal_map_texture` for free, and M7 already returns normal maps linear (`is_normal_map` covers `TEXTUREFLAGS_NORMAL`, `SSBUMP` and `UV88`).
 - Honour `m_Skin` against the MDL's skin family table, and skip props whose `m_nMinDXLevel`/`m_nMaxDXLevel` exclude a modern renderer.
 
-**Verify:** all 233 maps place their props — **353 116 total** — with 0 lump errors and 0 out-of-range dictionary indices. Prop and world triangle counts appear separately in the F1 HUD. Screenshot `cp_badlands`: barrels, fences and signs sit on the ground at the right scale and orientation.
+**Verify:** this gate is about *placement*, since M12 already proved the lump parses. All 233 maps spawn their props with every model resolved to a mesh; prop and world triangle counts appear separately in the F1 HUD. Screenshot `cp_badlands`: barrels, fences and signs sit **on the ground** at the right scale and orientation. Add a coverage-style measure that a count alone cannot pass — the fraction of props whose transform is distinct, or the spread of their positions against the map bounds — because 353 116 props all stacked at the origin satisfies every count-based check.
 
-### M14 — Prop lighting from the baked scene
+### M15 — Prop lighting from the baked scene
 
 The milestone that makes props belong rather than float.
 
@@ -206,10 +217,10 @@ The milestone that makes props belong rather than float.
 
 ```bash
 cargo test --workspace
-cargo run -p mdl --example mdldump  -- --all-models "<tf dir>"   # 16 215 MDL/VVD/VTX sets
-cargo run -p mdl --example mdldump  -- --all-maps   "<tf dir>"   # every model the maps reference
-cargo run -p bsp --example propdump -- --all-maps   "<tf dir>"   # 353 116 props, all 4 sprp versions
-cargo run -p bevy_bsp --example skydump -- --all-maps "<tf dir>" # every skyname, continuity scored
+cargo run -p bevy_bsp --example skydump -- --all-maps "<tf dir>" # M9:  every skyname, continuity scored
+cargo run -p bsp --example propdump -- --all-maps   "<tf dir>"   # M12: 353 116 props, all 4 sprp versions
+cargo run -p mdl --example mdldump  -- --all-models "<tf dir>"   # M13: 16 215 MDL/VVD/VTX sets
+cargo run -p mdl --example mdldump  -- --all-maps   "<tf dir>"   # M13: needs M12 for the model list
 cargo run --release -- --map <name> --screenshot out.png         # ~10 maps by default
 ```
 
