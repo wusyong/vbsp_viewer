@@ -626,6 +626,7 @@ dependencies = [
  "bsp",
  "half",
  "vfs",
+ "vtf",
 ]
 
 [[package]]

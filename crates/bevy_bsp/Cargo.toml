@@ -9,3 +9,4 @@ bevy.workspace = true
 half.workspace = true
 bsp = { path = "../bsp" }
 vfs = { path = "../vfs" }
+vtf = { path = "../vtf" }

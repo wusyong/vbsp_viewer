@@ -10,6 +10,13 @@
 //! **Y-up**, right-handed, with −Z forward. [`src_to_bevy`] maps between them;
 //! see its docs for why triangle winding survives untouched.
 
+pub mod material;
+
+pub use material::{
+    load_materials, MapMaterials, MaterialContext, MaterialStats, SourceMaterial,
+    SourceMaterialPlugin, SOURCE_OVERBRIGHT,
+};
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::Exposure;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -58,15 +65,6 @@ pub fn bevy_to_src(v: Vec3) -> [f32; 3] {
     [v.x, -v.z, v.y]
 }
 
-/// Source's `OVERBRIGHT`: `LightmappedGeneric` multiplies the baked lightmap
-/// by 2 before modulating albedo.
-///
-/// **Not** folded into [`lightmap_exposure`]. That factor exists to be
-/// cancelled by a real texture's reflectance — Source albedos average well
-/// under 0.5 — so applying it against the white placeholder just clips every
-/// sunlit surface to flat white. M8 applies it alongside `$basetexture`.
-pub const SOURCE_OVERBRIGHT: f32 = 2.0;
-
 /// The `StandardMaterial::lightmap_exposure` that makes a Source lightmap read
 /// correctly through Bevy's photographic pipeline.
 ///
@@ -75,8 +73,13 @@ pub const SOURCE_OVERBRIGHT: f32 = 2.0;
 /// Source's luxels are a plain reflectance factor around 1.0, so they have to
 /// be scaled by the inverse of that exposure to land back at unity. Deriving it
 /// rather than hardcoding 1000 keeps this correct if Bevy's default moves.
-pub fn lightmap_exposure() -> f32 {
-    1.0 / Exposure::default().exposure()
+///
+/// `overbright` is Source's own factor — [`SOURCE_OVERBRIGHT`] once a real
+/// `$basetexture` is in place, since it exists to be cancelled by the texture's
+/// reflectance, and 1.0 against a white placeholder, where it would only clip
+/// every sunlit surface.
+pub fn lightmap_exposure(overbright: f32) -> f32 {
+    overbright / Exposure::default().exposure()
 }
 
 /// Upload a packed lightmap atlas as a texture.
@@ -174,6 +177,17 @@ pub struct MapInfo {
     /// Brush entities drawn — doors, gates, func_brush detail.
     pub brush_entities: usize,
     pub brush_entity_triangles: usize,
+    /// Materials resolved, and how their textures reached the GPU.
+    pub materials_resolved: usize,
+    pub materials_missing: usize,
+    pub textures: usize,
+    pub textures_missing: usize,
+    pub bcn_passthrough: usize,
+    pub cpu_decoded: usize,
+    pub texture_bytes: u64,
+    pub vertex_blend: usize,
+    pub translucent: usize,
+    pub alpha_tested: usize,
 }
 
 /// Build a Bevy mesh from one material's worth of BSP geometry.
@@ -194,10 +208,11 @@ pub fn surface_to_mesh(surface: &Surface) -> Mesh {
         normals.push(src_to_bevy_dir(v.normal).to_array());
         uvs.push(v.uv);
         lightmap_uvs.push(v.lightmap_uv);
-        // Displacement blend weight. Brush faces leave this at 0, so a plain
-        // grey keeps them unchanged while terrain blend zones show a gradient.
-        let shade = 1.0 - v.alpha * 0.45;
-        colors.push([shade, shade, shade, 1.0]);
+        // The `$basetexture2` blend weight rides vertex **alpha**, with RGB
+        // left at 1: the PBR path multiplies `base_color` by the vertex colour,
+        // so anything but 1 there would tint every surface. Brush faces leave
+        // alpha at 0, which selects `$basetexture` alone.
+        colors.push([1.0, 1.0, 1.0, v.alpha]);
     }
 
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
@@ -254,16 +269,18 @@ impl MapLightmap {
     }
 }
 
-/// What a map contributes to every surface it spawns: the material names to
-/// resolve a `texdata` index against, and the bake to attach.
+/// What a map contributes to every surface it spawns: the resolved materials,
+/// their names, and the bake to attach.
 ///
-/// These always travel together — a lightmap is packed for exactly the faces
-/// of the geometry being spawned — so they are one parameter rather than two.
+/// These always travel together — a lightmap is packed for exactly the faces of
+/// the geometry being spawned — so they are one parameter rather than three.
 #[derive(Clone, Copy)]
 pub struct MapSurfaces<'a> {
     /// Indexed by TEXDATA index; see [`bsp::Bsp::texture_names`].
     pub material_names: &'a [&'a str],
-    /// `None` renders with the debug palette and no baked lighting.
+    /// One material per TEXDATA index, from [`load_materials`].
+    pub materials: &'a MapMaterials,
+    /// `None` leaves surfaces unlit by the bake.
     pub lightmap: Option<&'a MapLightmap>,
 }
 
@@ -284,7 +301,6 @@ impl MapSurfaces<'_> {
 pub fn spawn_model(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
     geometry: &ModelGeometry,
     surfaces: MapSurfaces,
     origin: [f32; 3],
@@ -295,27 +311,18 @@ pub fn spawn_model(
     let lightmap = surfaces.lightmap;
     for surface in &geometry.surfaces {
         let name = surfaces.name(surface.texdata);
-
-        let material = materials.add(StandardMaterial {
-            // White albedo under a lightmap: what is on screen is then the
-            // bake itself, which is the only way to tell a lighting bug from a
-            // material bug. The viewer swaps in `debug_material_color` on
-            // demand.
-            base_color: match lightmap {
-                Some(_) => Color::WHITE,
-                None => debug_material_color(name),
-            },
-            perceptual_roughness: 0.9,
-            lightmap_exposure: lightmap.map_or(0.0, |l| l.exposure),
-            // Backface culling stays ON deliberately: it is the only cheap
-            // check that winding and normals actually agree with the BSP. With
-            // it disabled, inverted geometry looks perfectly fine.
-            ..default()
-        });
+        // Materials are resolved once per map, not once per surface: a texdata
+        // shared by twenty surfaces is one material and one draw call's worth
+        // of state. Backface culling stays on per material unless `$nocull`
+        // asks otherwise — it is the only cheap check that winding and normals
+        // agree with the BSP.
+        let Some(material) = surfaces.materials.get(surface.texdata) else {
+            continue;
+        };
 
         let mut entity = commands.spawn((
             Mesh3d(meshes.add(surface_to_mesh(surface))),
-            MeshMaterial3d(material),
+            MeshMaterial3d(material.clone()),
             Transform::from_translation(translation),
             MapGeometry,
             SurfaceInfo {
@@ -343,27 +350,19 @@ pub fn spawn_model(
 pub fn spawn_displacements(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
     geometry: &DispGeometry,
     surfaces: MapSurfaces,
 ) -> usize {
     let lightmap = surfaces.lightmap;
     for surface in &geometry.surfaces {
         let name = surfaces.name(surface.texdata);
-
-        let material = materials.add(StandardMaterial {
-            base_color: match lightmap {
-                Some(_) => Color::WHITE,
-                None => debug_material_color(name),
-            },
-            perceptual_roughness: 0.95,
-            lightmap_exposure: lightmap.map_or(0.0, |l| l.exposure),
-            ..default()
-        });
+        let Some(material) = surfaces.materials.get(surface.texdata) else {
+            continue;
+        };
 
         let mut entity = commands.spawn((
             Mesh3d(meshes.add(surface_to_mesh(surface))),
-            MeshMaterial3d(material),
+            MeshMaterial3d(material.clone()),
             Transform::IDENTITY,
             DisplacementGeometry,
             SurfaceInfo {
@@ -410,9 +409,37 @@ pub fn map_info(
         lightmap_occupancy: atlas.map_or(0.0, |a| a.stats.occupancy(a.pixel_count())),
         lightmap_peak: atlas.map_or(0.0, |a| a.stats.peak),
         // Filled in by the caller: brush entities are placed from the ENTITIES
-        // lump, which this crate does not read.
+        // lump, which this crate does not read, and materials are loaded
+        // separately so a map can be built without a VFS at all.
         brush_entities: 0,
         brush_entity_triangles: 0,
+        materials_resolved: 0,
+        materials_missing: 0,
+        textures: 0,
+        textures_missing: 0,
+        bcn_passthrough: 0,
+        cpu_decoded: 0,
+        texture_bytes: 0,
+        vertex_blend: 0,
+        translucent: 0,
+        alpha_tested: 0,
+    }
+}
+
+impl MapInfo {
+    /// Fold in what [`load_materials`] reported.
+    pub fn with_materials(mut self, stats: &MaterialStats) -> MapInfo {
+        self.materials_resolved = stats.resolved;
+        self.materials_missing = stats.missing.len();
+        self.textures = stats.textures;
+        self.textures_missing = stats.missing_textures.len();
+        self.bcn_passthrough = stats.bcn_passthrough;
+        self.cpu_decoded = stats.cpu_decoded;
+        self.texture_bytes = stats.texture_bytes;
+        self.vertex_blend = stats.vertex_blend;
+        self.translucent = stats.translucent;
+        self.alpha_tested = stats.alpha_tested;
+        self
     }
 }
 
