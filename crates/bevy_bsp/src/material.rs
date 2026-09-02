@@ -407,6 +407,77 @@ impl Loader<'_> {
     }
 }
 
+/// Why a VTF could not become an `Image`.
+///
+/// Separate from [`vtf::VtfError`] because a size mismatch is not a parse
+/// failure: the VTF read fine and the *result* is inconsistent with the
+/// descriptor built from it.
+#[derive(Debug, thiserror::Error)]
+pub enum TextureError {
+    #[error(transparent)]
+    Vtf(#[from] vtf::VtfError),
+
+    /// The concatenated pixel data is not the size the texture descriptor
+    /// claims. See [`gpu_bytes`] for why this has to be checked by hand.
+    #[error(
+        "{format:?} {width}x{height} with {mips} mip level(s) needs {expected} bytes, got {actual}"
+    )]
+    SizeMismatch {
+        format: TextureFormat,
+        width: u32,
+        height: u32,
+        mips: u32,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// wgpu reports no fixed block size for the format — depth and stencil
+    /// formats, none of which a VTF can hold. Failing closed rather than
+    /// skipping the check.
+    #[error("wgpu reports no block size for {0:?}, so its size cannot be checked")]
+    UnknownBlockSize(TextureFormat),
+}
+
+/// Exactly how many bytes wgpu will read for a 2D texture of this format, size
+/// and mip count.
+///
+/// # Why this is computed by hand
+///
+/// [`Image::new`] checks that `data.len()` matches its descriptor and is
+/// therefore unusable here: its check assumes a **single** mip level, so handing
+/// it a whole chain fails. [`Image::new_uninit`] skips the check entirely — it is
+/// a plain struct literal with `data: None` — which is what makes it the right
+/// constructor for a chain and also what leaves nothing validating the result.
+///
+/// Without this, a wrong mip offset or a miscounted level produces a
+/// **plausible-looking texture** rather than an error, on the path 99.7% of TF2's
+/// textures take. That is the worst failure mode there is: silently wrong output
+/// that no sweep reports.
+///
+/// Block-compressed formats count in whole blocks, so each level is
+/// `ceil(w / block_w) * ceil(h / block_h)` blocks — which is also how
+/// [`collect_mips`] can stop early without the arithmetic disagreeing.
+pub fn gpu_bytes(
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    mips: u32,
+) -> Result<u64, TextureError> {
+    let block_bytes = format
+        .block_copy_size(None)
+        .ok_or(TextureError::UnknownBlockSize(format))? as u64;
+    let (block_w, block_h) = format.block_dimensions();
+
+    let mut total = 0u64;
+    for level in 0..mips {
+        // wgpu's mip sizing: halve and clamp at 1, per level.
+        let w = (width >> level).max(1);
+        let h = (height >> level).max(1);
+        total += u64::from(w.div_ceil(block_w)) * u64::from(h.div_ceil(block_h)) * block_bytes;
+    }
+    Ok(total)
+}
+
 /// Whether a texture holds colour (sRGB) or data (linear).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TextureUse {
@@ -440,7 +511,7 @@ pub fn passthrough_format(format: ImageFormat, srgb: bool) -> Option<TextureForm
 ///
 /// Uses frame [`Vtf::first_frame`] and face 0: animated textures and cubemap
 /// faces are phase 2.
-pub fn vtf_image(vtf: &Vtf, srgb: bool) -> Result<Image, vtf::VtfError> {
+pub fn vtf_image(vtf: &Vtf, srgb: bool) -> Result<Image, TextureError> {
     let frame = usize::from(vtf.first_frame).min(usize::from(vtf.frames) - 1);
     let (format, data, mips) = match passthrough_format(vtf.format, srgb) {
         Some(format) => {
@@ -476,7 +547,21 @@ pub fn vtf_image(vtf: &Vtf, srgb: bool) -> Result<Image, vtf::VtfError> {
     // passthrough formats (`RGBA8888`, `BGRA8888`: 481 of the textures the maps
     // use) ever tripped it, which is why the first maps rendered looked fine.
     // `new_uninit` skips a single-level invariant that a mip chain does not
-    // have, and the descriptor and data are then set together.
+    // have, and the descriptor and data are then set together — so the size
+    // check `Image::new` would have done is done by hand below instead. Skipping
+    // it is what let a wrong offset yield a plausible texture.
+    let expected = gpu_bytes(format, width, height, mips)?;
+    if expected != data.len() as u64 {
+        return Err(TextureError::SizeMismatch {
+            format,
+            width,
+            height,
+            mips,
+            expected,
+            actual: data.len() as u64,
+        });
+    }
+
     let mut image = Image::new_uninit(
         Extent3d {
             width,
@@ -496,7 +581,7 @@ pub fn vtf_image(vtf: &Vtf, srgb: bool) -> Result<Image, vtf::VtfError> {
 
 /// Concatenate the mip chain largest-first, stopping where wgpu can no longer
 /// take a block-compressed level.
-fn collect_mips(vtf: &Vtf, frame: usize) -> Result<(Vec<u8>, u32), vtf::VtfError> {
+pub(crate) fn collect_mips(vtf: &Vtf, frame: usize) -> Result<(Vec<u8>, u32), vtf::VtfError> {
     let block = vtf.format.block_bytes().map(|_| 4u32);
     let mut data = Vec::with_capacity(vtf.image_bytes() as usize);
     let mut count = 0u32;
@@ -555,6 +640,76 @@ fn sampler_for(vtf: &Vtf) -> ImageSamplerDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hand-computed byte counts, so the arithmetic is pinned to numbers that
+    /// were worked out independently of the code.
+    #[test]
+    fn gpu_bytes_matches_hand_computed_sizes() {
+        // BC1: 4x4 blocks of 8 bytes. 512x512 is 128x128 blocks.
+        assert_eq!(
+            gpu_bytes(TextureFormat::Bc1RgbaUnorm, 512, 512, 1).unwrap(),
+            128 * 128 * 8,
+        );
+        // The full chain down to 4x4, which is where `collect_mips` stops for a
+        // BC texture: 128^2 + 64^2 + ... + 1^2 = 21 845 blocks.
+        assert_eq!(
+            gpu_bytes(TextureFormat::Bc1RgbaUnorm, 512, 512, 8).unwrap(),
+            21_845 * 8,
+        );
+        // BC3 carries an alpha block too, so 16 bytes per block.
+        assert_eq!(
+            gpu_bytes(TextureFormat::Bc3RgbaUnorm, 512, 512, 1).unwrap(),
+            128 * 128 * 16,
+        );
+        // Uncompressed: 1x1 "blocks" of 4 bytes, and non-square works.
+        assert_eq!(
+            gpu_bytes(TextureFormat::Rgba8Unorm, 512, 256, 1).unwrap(),
+            512 * 256 * 4,
+        );
+    }
+
+    /// A block-compressed level smaller than one block still costs a whole
+    /// block, and mip sizes clamp at 1 rather than reaching 0.
+    ///
+    /// `collect_mips` stops before these levels for TF2's power-of-two
+    /// textures, but a packed community texture can reach them, and getting the
+    /// rounding wrong here would make the check reject a *correct* chain — a
+    /// false alarm being just as bad as a missed one.
+    #[test]
+    fn gpu_bytes_rounds_partial_blocks_up() {
+        // 8x4 BC1: level 0 is 2x1 blocks, levels 1 (4x2) and 2 (2x1) are 1x1
+        // block each. 4 blocks of 8 bytes.
+        assert_eq!(gpu_bytes(TextureFormat::Bc1RgbaUnorm, 8, 4, 3).unwrap(), 32);
+        // A 1x1 BC1 texture is one whole block.
+        assert_eq!(gpu_bytes(TextureFormat::Bc1RgbaUnorm, 1, 1, 1).unwrap(), 8);
+        // Enough levels to drive both axes past 1: they clamp, not wrap. Level
+        // 0 is 2x1 texels and levels 1-3 are all 1x1, so five texels of four
+        // bytes rather than the zero-sized levels a bare shift would give.
+        assert_eq!(gpu_bytes(TextureFormat::Rgba8Unorm, 2, 1, 4).unwrap(), 5 * 4);
+    }
+
+    /// **The check must be able to fail.** A `SizeMismatch` is only worth having
+    /// if a wrong byte count is actually rejected, so both directions are
+    /// asserted against the size the descriptor implies.
+    #[test]
+    fn a_wrong_byte_count_is_rejected() {
+        let format = TextureFormat::Bc1RgbaUnorm;
+        let correct = gpu_bytes(format, 512, 512, 8).unwrap();
+
+        // One level miscounted either way changes the expected size, which is
+        // exactly the bug this guards: `collect_mips` returning a count that
+        // does not match what it concatenated.
+        assert_ne!(gpu_bytes(format, 512, 512, 7).unwrap(), correct);
+        assert_ne!(gpu_bytes(format, 512, 512, 9).unwrap(), correct);
+        // So does a wrong format for the same dimensions — BC1 against BC3 is
+        // the pairing `passthrough_format` could plausibly get wrong.
+        assert_ne!(
+            gpu_bytes(TextureFormat::Bc3RgbaUnorm, 512, 512, 8).unwrap(),
+            correct,
+        );
+        // And a wrong base size.
+        assert_ne!(gpu_bytes(format, 256, 512, 8).unwrap(), correct);
+    }
 
     #[test]
     fn the_common_formats_go_to_the_gpu_compressed() {
