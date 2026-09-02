@@ -10,10 +10,12 @@
 Phase 1 delivered a working map viewer: brush geometry, displacement terrain, VTF textures and baked lightmaps, verified across all 233 shipped TF2 maps. What it renders is *architecturally* complete and *visually* half-finished. Three gaps dominate a screenshot:
 
 - **The sky is a flat clear colour.** Every one of the 233 maps names a real sky, and 215 additionally place a `sky_camera` for a 3D skybox.
-- **Water is a provisional translucent teal.** 547 material references use the `Water` shader, and none has a `$basetexture` to draw.
+- **Water is a provisional translucent teal.** 603 water surfaces across 144 maps, 464 distinct materials — and only 65 of those have a `$basetexture` to draw.
 - **There are no props.** 353 116 static props across 8 584 unique models — the barrels, fences, pipes, signs and ammo crates that make a Source map read as populated rather than as bare architecture.
 
 **Order: sky and water first, props second.** Sky and water reuse the VTF/VMT/KeyValues work already shipped and need no new binary format, so they land quickly and change screenshots immediately. Props are three new interlocking formats and deserve their own uninterrupted run of milestones.
+
+**⚠️ Within that, water must precede the 3D skybox.** Not a preference — the sky pass draws its own room's water (`DF_RENDER_WATER` in `CSkyboxView::Setup`), and `ctf_2fort`'s sky room is 51 faces of which 22 are water. M11 is unverifiable on most maps until M10 works. Both were attempted in the other order, and both were reverted.
 
 **Definition of done:** `cargo run -- --map cp_badlands` shows a textured sky, a scaled 3D skybox, fogged water, and populated props lit consistently with the baked world. All 233 maps load without error, and coverage-measured screenshots stay non-empty.
 
@@ -100,9 +102,63 @@ By contrast **VVD is version 4 and VTX version 7, uniformly** (14 065 and 14 064
 
 ### Water materials
 
-- **Not identifiable by shader name alone.** `nature/water_movingplane` is **`LightmappedGeneric` with `%compilewater 1`**, `$abovewater 1`, `$bottommaterial`, `$bumpmap dev/water_normal`, `$envmap env_cubemap`. `dev/dev_water3` is shader **`Water`**.
-- `$reflecttexture`/`$refracttexture` name **render targets** (`_rt_WaterReflection`), not files, and sit inside `Water_DX90` sub-blocks — which the VMT itself comments are *"used to determine whether to do the reflection"*, i.e. presence is the switch.
-- 49 water materials under `materials/nature/` alone; the Phase 1 census counted **547 `Water` references** across all maps.
+> **Rewritten after both M10 and M11 were reverted.** Every number here is
+> measured from the shipped game or read out of the SDK; the paragraph this
+> replaced was assembled from a shader-name census and got three things wrong.
+
+- **603 water surfaces across 144 of the 233 maps, 464 distinct materials.** The
+  earlier "547 `Water` references" counted something else — 403 of the 464
+  materials use the `Water` shader, and the rest are `LightmappedGeneric` (56),
+  `LightMappedGeneric` (4, note the case) and `UnlitGeneric` (1).
+- **⚠️ Two of the three classifiers are redundant, and the plan's reason for
+  using all three was wrong.** Measured over the 464:
+
+  | test | catches |
+  |---|---|
+  | shader is `Water*` | 403 |
+  | `%compilewater 1` | **464** |
+  | `SURF_WARP` on the face | **464** |
+
+  `%compilewater` and `SURF_WARP` agree on *every single material* — which is
+  causation, not luck: vbsp reads `%compilewater` and sets `SURF_WARP` from it.
+  The **shader name** is the one that genuinely falls short. Test all three
+  anyway, but for robustness (a face whose VMT is missing still has its bit),
+  not because no single test suffices.
+- **⚠️ A colour's scale comes from its delimiter, and the two differ by 255×.**
+  `{51 43 13}` is 0–255 integers; `[0.95 1.0 0.97]` is 0–1 floats. The same key
+  takes either form: `$fogcolor` is brace in **all 446** materials that set it,
+  while `$reflecttint` is 47 brace / 16 bracket and `$refracttint` 46 / 14. Read
+  a brace value as floats and the clamp turns 2fort's dark olive into **pure
+  white** — which, with a working depth gradient, still looks like water.
+- **⚠️ The ripple key is `$normalmap`, not `$bumpmap`** — 459 materials against
+  61 — and the SDK agrees:
+  `SHADER_PARAM( NORMALMAP, ..., "dev/water_normal", "normal map" )`.
+- **The ripple is a 60-frame animation, not a scroll.**
+  `water/tfwater001_normal.vtf` carries 60 frames, played by an
+  `AnimatedTexture` proxy at `animatedtextureframerate 30.00` — a two-second
+  loop, and it *is* the motion. Two `Sine` proxies (periods 24 s and 16 s, ±0.5,
+  the second with `sinemin`/`sinemax` swapped for phase inversion) drift its UVs
+  on top via `$bumptransform`.
+- **`$bottommaterial` is resolved at compile time**, on 444 materials. vbsp's
+  `AssignBottomWaterMaterialToFace` (`utils/vbsp/faces.cpp:1255`) rewrites the
+  **downward-facing** water face's texinfo, so the underside is already separate
+  geometry in the BSP. There is nothing to swap at runtime.
+- `$reflecttexture`/`$refracttexture` name **render targets**
+  (`_rt_WaterReflection`), not files. But `WaterCheap` needs neither — see M10.
+- `$envmap` is on **447** of the 464; `$fogcolor`/`$fogstart`/`$fogend`/
+  `$fogenable` on 446; `$abovewater` on 459; `$scale` on 403; `$forcecheap` on
+  33 and `$forceexpensive` on 9.
+- **SDK defaults, which are not neutral:** `$cheapwaterstartdistance` 500,
+  `$cheapwaterenddistance` 1000, `$forceexpensive` **1** on PC, and `$fogcolor`
+  defaults to **`(1 0 0)` — red — with a `Warning`**
+  (`materialsystem/stdshaders/water.cpp:61-129`). A missing `$fogcolor` is a loud
+  authoring error; defaulting it to something tasteful hides exactly what the
+  engine shouts about.
+- **`$fogstart` is frequently negative** — `water/water_2fort.vmt` is
+  `-100 .. 400` — meaning the fog has already begun at the waterline.
+- Water is **lightmapped** (`MATERIAL_VAR2_LIGHTING_LIGHTMAP`) and needs a
+  **tangent basis** (`MATERIAL_VAR2_NEEDS_TANGENT_SPACES`), both set in
+  `water.cpp`'s `SHADER_INIT_PARAMS` (:61-129).
 
 ---
 
@@ -114,16 +170,17 @@ One new crate; the existing four grow. Phase 1's split holds — nothing below `
 crates/
   bsp/      + gamelump.rs   (M12: per-lump LZMA, sprp v5/6/7/10, dprp)
             + ambient.rs    (M15: leaf ambient cube lookup)
-            + cluster.rs    (M11: leaf/cluster partition, for the 3D skybox)
+            + area.rs       (M11: BSP areas + point-to-leaf walk, for the sky room)
             examples/propdump.rs
   mdl/      NEW — studiohdr / VVD / VTX, engine-free
             examples/mdldump.rs
   vfs/      (unchanged — pakfile mounting already covers packed models)
   vtf/      (unchanged — cubemap faces already exposed via surface())
-  bevy_bsp/ + sky.rs   (M9: six quads, six native-size 2D faces — no cubemap)
-            + water.rs (M10)
-            + props.rs (M14)
-            examples/skydump.rs
+  bevy_bsp/ + sky.rs      (M9:  six quads, six native-size 2D faces — no cubemap)
+            + water.rs    (M10: WaterCheap tier, then the fog volume)
+            + skybox3d.rs (M11: sky-camera transform + the two-pass setup)
+            + props.rs    (M14)
+            examples/skydump.rs, waterdump.rs, skyroom.rs
 ```
 
 `crates/mdl` returns plain vertex/index buffers plus material names, exactly as `bsp::geometry` does, so the Bevy layer stays a thin adapter. Static props are rigid, so **no skinning** in Phase 2 — but bone transforms are read, because a model's bind pose is not guaranteed to be identity.
@@ -436,21 +493,199 @@ out half a face and requires the mean to jump while the spread does not.
 
 ### M10 — Water
 
-- Classify a surface as water by **any** of: shader `Water`, `%compilewater 1`, or `SURF_WARP` on the face. Measured above — no single test suffices.
-- Render as a translucent surface: `$fogcolor` tint with `$fogstart`/`$fogend` depth attenuation, `$bumpmap` scrolling as a ripple normal, `$reflecttint`/`$refracttint` where present. Honour `$abovewater`; note `$bottommaterial` for the under-surface case.
-- `$reflecttexture`/`$refracttexture` are render targets, so **planar reflection is deliberately deferred** — a screen-space approximation via Bevy's `ssr` module is the natural follow-up, not this milestone's gate.
-- Sort back-to-front through the existing translucent path. Water is flat and large, so self-ordering is the failure to watch for.
+> **Rewritten after the first attempt was reverted.** The milestone this replaced
+> said to render water as a translucent surface with `$fogstart`/`$fogend`
+> attenuation, a `$bumpmap` scroll and `$reflecttint`. Four of those five details
+> were wrong; the corrections are below, each with a line behind it. **M10 now
+> comes before M11**, because the sky pass draws its room's water
+> (`DF_RENDER_WATER` in `CSkyboxView::Setup`) and `ctf_2fort`'s sky room is 51
+> faces of which 22 are water — M11 is unverifiable on most maps until this
+> works.
 
-**Verify:** all 547 `Water` references resolve; water on `ctf_2fort`, `pl_badwater` and `koth_lakeside_final` reads as water rather than teal; no z-fighting against the pool floor.
+Source ships **two** water tiers and only one of them needs render targets. This
+milestone lands the render-target-free tier exactly, then adds the fog.
+
+#### M10a — the cheap tier, exactly as the SDK writes it
+
+`materialsystem/stdshaders/WaterCheap_ps2x.fxc`'s opaque branch, in full:
+
+```c
+HALF3 reflectVect = CalcReflectionVectorUnnormalized( worldSpaceNormal, worldSpaceEye );
+HALF3 specularLighting = ENV_MAP_SCALE * texCUBE( EnvmapSampler, reflectVect );
+specularLighting *= g_ReflectTint;
+HALF flDotResult = 1.0f - max( 0.0f, dot( worldSpaceEye, worldSpaceNormal ) );
+HALF flFresnelFactor = flDotResult * flDotResult;          // ^2
+flFresnelFactor *= flFresnelFactor;                        // ^4
+flFresnelFactor *= flDotResult;                            // ^5
+...
+flAlpha = 1.0f;
+specularLighting = lerp( g_WaterFogColor, specularLighting, flFresnelFactor );
+```
+
+So: **opaque**, `mix($fogcolor, envmapReflection × $reflecttint, fresnel)`. No
+depth prepass, no blending, no render targets, nothing to sort.
+
+- **Reflection comes from M9's six sky faces**, sampled by the reflection vector.
+  `$envmap env_cubemap` is on 447 of 464 materials and open-air water reflects
+  sky almost exclusively, which is nearly all of TF2's water. Reuse
+  `sky::SkyFace::axes` and `FaceAxes::coords` for the direction→face lookup
+  rather than writing new cube maths. The real `env_cubemap` (CUBEMAPS lump) is a
+  later upgrade, and is what indoor water needs.
+- **⚠️ Leave backface culling ON.** This is the single most important line in the
+  milestone. The top face (+Z, water material) and the bottom face (−Z,
+  `$bottommaterial`) are a *coincident matched pair* emitted by vbsp, and culling
+  is what selects the right one. The reverted attempt set `cull_mode: None`, drew
+  both, and let the down-facing one win the depth fight — which is why
+  `dot(to_eye, n)` measured −1, the fresnel saturated to 1, and every surface came
+  out flat opaque white. "Orient the normal toward the viewer" treated the
+  symptom of a self-inflicted bug.
+- **⚠️ Generate tangents.** `MATERIAL_VAR2_NEEDS_TANGENT_SPACES` is set for water,
+  and the basis is derivable exactly from data already parsed —
+  `GenerateDispSurfTangentSpaces` (`public/builddisp.cpp:1692`):
+
+  ```c
+  TangentT = normalize( tAxis );
+  TangentS = normalize( cross( Normal, TangentT ) );
+  TangentT = normalize( cross( TangentS, Normal ) );
+  if ( dot( planeNormal, cross( sAxis, tAxis ) ) > 0 ) TangentS = -TangentS;
+  ```
+
+  `sAxis`/`tAxis` are `texinfo.texture_vecs[0]`/`[1]`. The reverted attempt had
+  no tangents at all, so the ripple normal was applied in a bogus basis — and a
+  wrong basis still shimmers plausibly, which is why it needs a test rather than
+  an eyeball.
+- The animated `$normalmap` uploads as a **texture array**, one layer per frame,
+  selected with `floor(time × 30) % frames` and **nearest layer** — a blend of
+  frame 7 and 8 of a normal map is not a normal.
+- `$bottommaterial` needs **no runtime handling**: those faces are already in the
+  BSP with their own material.
+
+#### M10b — the fog volume
+
+Only once M10a reads right on its own.
+
+**⚠️ The mechanism is a fog volume, not a term in the water shader.**
+`CAboveWaterView::CRefractionView::Draw` renders the refraction pass with the
+water's own fog volume enabled and the target cleared to the fog colour:
+
+```c
+SetFogVolumeState( GetOuter()->m_fogInfo, true );   // bUseHeightFog
+SetClearColorToFogColor();
+DrawExecute( ..., VIEW_REFRACTION, ... );
+```
+
+So `$fogstart`/`$fogend` **do** shape the above-water look — as attenuation along
+the submerged part of the view ray. The water shader's *own* extra term,
+`saturate(destAlphaDepth − 0.05)`, is a separate distance fade that needs
+`OO_DESTALPHA_DEPTH_RANGE`, a constant that exists only inside the engine.
+**Skip that term and say so** rather than inventing a value.
+
+- `DepthPrepass` on the main camera; `WaterMaterial::enable_prepass() -> false`,
+  or water measures its own depth and comes out perfectly clear.
+- `f = saturate((submergedDepth − $fogstart) / ($fogend − $fogstart))`, guarding a
+  non-positive span.
+- `AlphaMode::Blend`, expanding Source's two nested lerps so one blended surface
+  reproduces them exactly:
+  `alpha = 1 − (1−f)(1−fresnel)`,
+  `rgb = ($fogcolor·f·(1−fresnel) + skyReflect·fresnel) / alpha`.
+
+**Verify.** `waterdump --census` and `waterdump --all-maps`, with four gates —
+each aimed at what a *plausible-looking* implementation gets wrong, because a
+flat tinted pane reads as water in a screenshot and counting surfaces proves
+nothing:
+
+1. **Coverage** — all 603 surfaces across the 144 maps resolve and parse. A
+   `SURF_WARP` face with no VMT still has to draw.
+2. **No fog colour reads as white** — the delimiter check. Injecting that bug made
+   443 of 464 materials white last time, so this gate is known to bite.
+3. **Every `$normalmap` resolves** and reports its frame count; a single frame
+   means static water (42 materials — reported, not failed).
+4. **Tangents are orthonormal on every water surface**, with the handedness flip
+   exercised. A wrong basis is invisible by eye.
+
+Visual: `ctf_2fort`'s moat after M10a (olive, sky reflection at grazing angles,
+opaque), then after M10b (the bottom visible through the shallows, fogging to
+olive with depth), then `pl_badwater` and `koth_lakeside_final`.
 
 ### M11 — 3D skybox
 
-- Read the first `sky_camera`: `origin`, `scale` (16 on most maps, up to 128), and its `fog*` keys.
-- **The hard part is knowing which geometry is skybox geometry.** The 3D skybox is ordinary worldspawn brushwork in a distant room; the engine separates it by drawing a sky pass with a scaled camera and relying on VIS. Phase 1 has no leaf separation — which is exactly why M3's auto-framing found `cp_badlands` spanning 16 500 units vertically. So M11 must **partition faces by leaf/cluster** (`crates/bsp/src/cluster.rs`), take the cluster containing the `sky_camera` origin as the sky room, and render those faces in a second pass transformed by `(world − sky_origin) / scale` relative to the camera.
-- That partition is also the groundwork VIS/PVS culling needs later, so build it properly rather than by bounding box.
-- The **18 maps with no `sky_camera`** must render exactly as they do today, and the 4 with multiple must use the first.
+> **Rewritten after the first attempt was reverted.** Its *architecture* was
+> right and is kept; what sank it was water (below), one silent query regression,
+> and a missing lightmap remap. The milestone this replaced proposed partitioning
+> by leaf **cluster** via `crates/bsp/src/cluster.rs` — the wrong key, needing the
+> VISIBILITY lump decompressed for no benefit.
 
-**Verify:** `cp_badlands` and `pl_upward` show distant mesas and structures with correct parallax; the trimmed-bounds camera no longer has skybox brushes in range; each of the 5 non-16 scales and the 4 multi-camera maps renders sanely.
+**The key is the BSP `area`, and it needs no visibility data at all.**
+`CSkyCamera` records the area its own origin falls in
+(`game/server/SkyCamera.cpp:108`):
+
+```c
+m_skyboxData.area = engine->GetArea( m_skyboxData.origin );
+```
+
+and `CSkyboxView::DrawInternal` restricts drawing to that area alone:
+
+```c
+tmpbits[m_pSky3dParams->area>>3] |= 1 << (m_pSky3dParams->area&7);
+*areabits = tmpbits;
+```
+
+Areas exist because of `func_areaportal`, and a sealed skybox room lands in one
+of its own. `dleaf_t` carries `area` in a 9-bit field we already parse. Measured
+across the 233 maps: the sky area holds a **median 0.6%** of a map's faces
+(min 0.1%).
+
+**The geometry is not scaled.** What `scale` divides is the *camera position* —
+`origin/scale + sky_origin` — so the room draws at 1:1 and reads as distant
+because the camera moves only 1/scale as far. As one translation:
+`P' = P − O + C·(1 − 1/s)`, updated per frame. Test it against the engine's
+formula, not against itself.
+
+**Two cameras, because the engine uses two passes.** `CSkyboxView::Setup`:
+
+```c
+*pClearFlags &= ~( VIEW_CLEAR_COLOR | VIEW_CLEAR_DEPTH | VIEW_CLEAR_STENCIL | VIEW_CLEAR_FULL_TARGET );
+*pClearFlags |= VIEW_CLEAR_DEPTH; // Need to clear depth after rendering the skybox
+m_DrawFlags = DF_RENDER_UNDERWATER | DF_RENDER_ABOVEWATER | DF_RENDER_WATER;
+if( r_skybox.GetBool() ) m_DrawFlags |= DF_DRAWSKYBOX;
+```
+
+Sky pass clears colour **and** depth and draws the room, its water and the 2D
+sky; the main pass clears **depth only**. Both of those matter: the 2D sky box
+belongs on the sky layer, or the main pass's depth clear lets it paint over the
+room.
+
+- **Skip the pass when the room holds no scenery.** **82 of 215** sky rooms
+  contain only `TOOLS/*` brushes — `cp_badlands`' is 36 `TOOLSBLACK` + 12
+  `TOOLSSKYBOX` — and drawing one paints a black band across the sky.
+  `engine->IsSkyboxVisibleFromPoint` is engine-side and unavailable, so
+  "the area contains non-tool faces" stands in for it. Say that it is a stand-in.
+- **⚠️ `LEAF_FLAGS_SKY` is not this test.** It looks perfect — *"this leaf has 3D
+  sky in its PVS"* (`public/bspfile.h:791`) — but *vrad* sets it as a lighting
+  flood-fill (`utils/vrad/lightmap.cpp:1349-1458`) and it covers ~50% of leaves on
+  every outdoor map: badlands 49.2%, 2fort 51.5%, carrier 50.3%.
+  `LEAF_FLAGS_SKY2D` is 0 on every TF2 map checked.
+- The **18 maps with no `sky_camera`** must render exactly as today; the **4** with
+  more than one use the first. **Never assume `scale` is 16** — 210 of 215 use it,
+  the rest 18, 32 (twice), 64 and `ctf_helltrain_event`'s 128.
+- **Two regressions to avoid, both of which failed silently:**
+  1. A second `Camera3d` makes any `Query<…, With<Camera3d>>.single()` return
+     `Err`. It broke `sky::follow_camera` and pinned the entire 2D sky box at the
+     world origin. Every such query needs `Without<Skybox3dCamera>`.
+  2. The room is a *separate* build from `world`, so the `atlas.remap` that ran on
+     `world` never touched it, leaving raw per-face lightmap UVs. Remap it too.
+
+**Verify.** `skyroom --census`: 215 cameras / 18 without / 4 multi; median
+sky-face share under 5%; the camera in a **non-solid leaf on 215/215**; the camera
+**inside its own area's face bounds on 215/215**. Those last two are the gates
+that bite — injecting the `-(leaf+1)` off-by-one fires them on 156 and 142 maps,
+where the median share only moves 0.6% → 5.2%.
+
+Visual: `cp_carrier` first (1144 scenery faces of clouds and sky cards, and it
+already rendered), then `ctf_2fort` and `pl_upward` once M10 makes their
+water-dominated rooms visible. Confirm the trimmed-bounds camera no longer has
+skybox brushwork in range — excluding the sky room shrinks the level's bounds on
+**63 of 215** maps, by up to 45%.
 
 ### M12 — Game lump reader (`bsp::gamelump`)
 
@@ -511,7 +746,10 @@ The milestone that makes props belong rather than float.
 
 ```bash
 cargo test --workspace
-cargo run -p bevy_bsp --example skydump -- --all-maps "<tf dir>" # M9:  every skyname, per-edge + sun check
+cargo run -p bevy_bsp --example skydump   -- --all-maps "<tf dir>" # M9:  every skyname, per-edge + sun check
+cargo run -p bevy_bsp --example waterdump -- --census   "<tf dir>" # M10: 464 materials and their params
+cargo run -p bevy_bsp --example waterdump -- --all-maps "<tf dir>" # M10: 603 surfaces, four gates
+cargo run -p bevy_bsp --example skyroom   -- --census   "<tf dir>" # M11: 215 sky_cameras, area shares
 cargo run -p bsp --example propdump -- --all-maps   "<tf dir>"   # M12: 353 116 props, all 4 sprp versions
 cargo run -p mdl --example mdldump  -- --all-models "<tf dir>"   # M13: 16 215 MDL/VVD/VTX sets
 cargo run -p mdl --example mdldump  -- --all-maps   "<tf dir>"   # M13: needs M12 for the model list
@@ -543,6 +781,10 @@ cargo run --release -- --map <name> --screenshot out.png         # ~10 maps by d
 | Pre-48 MDL layouts differ where we read → wrong bodyparts or materials | 50% of referenced models are pre-48. Assert the header prefix offsets hold on real files of all five versions before trusting any field. |
 | Game lump compressed span read from `filelen` → garbage props | Span comes from the next entry's `fileofs`. 177 maps compressed and 56 not, so the sweep exercises both paths. |
 | `sprp` v7 assumed identical to v10 because both are 72 bytes | Check against the SDK's V6/V10 structs; it is 1 map and 536 props, so fail closed with a warning rather than guess. |
-| 3D skybox needs leaf partitioning Phase 1 lacks | Build it as its own reviewable step in M11 — it is also the groundwork VIS culling needs. |
+| 3D skybox needs leaf partitioning Phase 1 lacks | Build it as `bsp::area` — BSP **areas**, not clusters, and no visibility data needed. Median 0.6% of faces per sky area across 233 maps. |
+| Water drawn double-sided → the down-facing `$bottommaterial` face wins the depth fight | Leave backface culling **on**. The two faces are a coincident matched pair emitted by vbsp; culling is what selects between them. Turning it off is what made every water surface flat white on the first attempt. |
+| A colour read at the wrong scale → every water surface white | `{...}` is 0–255 and `[...]` is 0–1, per *value* not per key. Gate on "no fog colour reads as white"; the injected bug turns 443 of 464 white. |
+| A second `Camera3d` silently breaks `single()` queries | Adding the sky-pass camera made `sky::follow_camera` return `Err` and pinned the 2D sky at the world origin. Every `With<Camera3d>` query needs `Without<Skybox3dCamera>`. |
+| A separately-built geometry set misses the lightmap remap | The sky room is its own `build_worldspawn_filtered`, so `atlas.remap` on `world` does not reach it. Remap every set that is spawned. |
 | Sky face orientation wrong → seams or a flipped sky | Six clamped 2D faces make cross-face filtering impossible, so a wrong face shows as wrong *content*, not as a hairline. Sides come from the SDK's axes; the two caps are measured. Cross-check against `light_environment`'s sun direction, which no self-consistent-but-wrong mapping can satisfy. |
 | Prop counts hurt frame time (4 383 on `pl_patagonia`) | Instance per unique model; honour `m_FadeMaxDist`; measure with the existing F1 frame timing before optimising. |
